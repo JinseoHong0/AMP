@@ -9,21 +9,22 @@
 
 - `venues` 최소 4건, `events` 최소 20건 시드 데이터(출처/`DEMO` 구분).
 - 공연 목록/상세/공연장 조회 API.
-- 자연어 검색 의도 추출·하드 필터(날짜·지역·대표 가격·필수 좌석 조건)·소프트 랭킹.
+- AI 검색 계획·DB 도구 조회/재조회·후보 비교/추천과 서버의 필수 조건·근거 검증.
 - 추천 최대 3개와 사실 기반 이유, 예매/현장/일반 가격 구분.
 - 공연별 방문 준비 카드: 입장/시작 시각 구분, 관람 방식·비지정석, 가격, 공연별 안내.
-- 검수된 한국어/영어 가이드와 미확인 표시, 기본 오류·0건 처리.
+- 한국어 원문/저장된 영어 가이드, 자동 번역 라벨·원문 보기·번역 없음 표시, 기본 오류·0건 처리.
 
 ### P1 — 공연 제공자 등록(최종 데모 포함 목표)
 
 - 포스터 이미지 업로드 → Vision 추출 → 기존 공연장 DB 유일 이름 매칭.
 - 매칭 실패/모호함 시 `GET /api/venues`에서 기존 장소 수동 선택.
-- 필드 수정·검수 → `POST /api/events` → 목록 및 조건부 추천 반영.
+- 원문 수정·확인 → `POST /api/events`에서 영문 자동 생성·저장 → 목록 및 조건부 추천 반영.
+- 번역 실패는 원문 등록과 분리하고 `POST /api/events/{id}/translate`로 번역만 재시도.
 - 등록 도중 중복 클릭, 이미지 오류, AI 실패 시 수동 등록 대체 경로.
 
 ### P2 — 이번 MVP에서 제외
 
-완제품 인증/공개 관리자 기능, 신규 공연장·아티스트 CRUD, 실시간 크롤링, 예매/결제, 커뮤니티, 북마크, 지도, 장문의 공연 공지 AI 자동 해석, 벡터 DB/RAG.
+완제품 인증/공개 관리자 기능, 신규 공연장·아티스트 CRUD, 실시간 크롤링, 예매/결제, 커뮤니티, 북마크, 지도, 장문의 공연 공지 AI 자동 해석, 벡터 DB/임베딩 검색. 현재 DB 조회 도구 기반 추천은 P0에 포함한다.
 
 > **P1은 최종 데모 범위이지만 구현 순서가 P0 이후**라는 의미다. P1이 실패해도 검색→추천→방문 준비의 P0 데모는 작동해야 한다.
 
@@ -35,7 +36,7 @@
 | FE 검색 | `Home`, `SearchBar`, `FilterChips`, `EventCard` | 추천/0건/미확인/가격 종류 표시 |
 | FE 상세/등록 | `EventDetail`, `VisitReadyCard`, `VenueGuide`, `PosterUpload`, `ReviewForm` | P0 방문 카드·KO/EN, P1 검수/장소 선택 |
 | BE | DB, Pydantic, `routers/events.py`, `routers/venues.py` | 목록/상세/기존 venue 목록/등록·검증 |
-| AI | `intent.py`, `ranker.py`, `reason.py`, `poster_parser.py`, `venue_matcher.py` | 조건 파싱, 규칙 랭킹, 포스터 추출, 장소 매칭 |
+| AI | `search_agent.py`, `search_tools.py`, `recommendation_validator.py`, `poster_parser.py`, `venue_matcher.py`, `translator.py` | DB 도구 호출·재조회·추천, BE와 조회/검증 계약 통합, 포스터 추출·장소 매칭·영문 번역 |
 
 **핵심 연결점:** `backend/models.py`·`schemas.py`의 모델 필드, `frontend/src/types/`의 TS 타입, `docs/API.md` JSON이 반드시 같아야 한다. AI 담당은 DB를 직접 쓰지 않고, 검수·저장은 BE가 책임진다.
 
@@ -70,11 +71,12 @@ amp-seoul/
 │   │   ├── recommend.py
 │   │   └── posters.py
 │   ├── services/
-│   │   ├── intent.py
-│   │   ├── ranker.py
-│   │   ├── reason.py
+│   │   ├── search_agent.py
+│   │   ├── search_tools.py
+│   │   ├── recommendation_validator.py
 │   │   ├── poster_parser.py
-│   │   └── venue_matcher.py
+│   │   ├── venue_matcher.py
+│   │   └── translator.py
 │   ├── models.py
 │   ├── schemas.py
 │   ├── database.py
@@ -94,7 +96,7 @@ amp-seoul/
 2. 입장 시각: `doors_open_at_utc`는 `starts_at_utc`와 별도. 모르면 null.
 3. 좌석: `seating_type`(standing/seated/mixed), `seat_assignment`(assigned/unassigned), `seating_preference`(소프트), `seating_requirement`(하드).
 4. 장소: `venue_id`는 신규 등록 시 기존 DB에 있어야 하며 `venue_match.status`와 `GET /api/venues`가 수동 선택에 사용된다.
-5. KO/EN 안내: `admission_notes_ko/en`(공연별), `entrance_hint_ko/en`(공연장 동선); 실시간 자동 번역은 없음.
+5. KO/EN: 공연 `title`, `description_ko`, `admission_notes_ko`, `drink_policy`는 등록 시 자동 번역하고 영어/상태/원문 지문/생성 시각을 저장한다. 장소 `entrance_hint_ko/en`은 기존 데이터 유지. 조회 시 모델 호출 없음.
 6. 발표 예시는 `DEMO`이며 실제 공연으로 오해되지 않게 표시한다.
 
 **문서 변경 절차:** 명세 변경 제안 → `DATABASE.md`/`API.md` 수정 → 관련 `AI.md`/`PROJECT.md`/타입 수정 → PR 리뷰 → merge. 문서와 실제 JSON이 다른 상태로 통합하지 않는다.
@@ -105,9 +107,9 @@ amp-seoul/
 |---|---|---|
 | 0~1h | 실행 환경, 레포, API/DB 필드 동결, mock 제공 | FE→BE `/api/health` 성공 |
 | 1~3h | DB/seed, GET 목록·상세·venue 조회; 검색 UI mock | `GET /api/events`, `/api/venues` 응답 일치 |
-| 3~5h | 자연어 → 조건 → 하드 필터 → 랭킹; 검색 카드 | 예산/좌석 필수·선호 규칙 테스트 |
+| 3~5h | AI 조회·재조회·추천과 검색 카드 통합 | 도구 인자·필수 조건 유지·근거 검증 |
 | 5~7h | 방문 준비 카드·가격 종류·KO/EN 통합 | 추천→상세→방문 정보 P0 완주 |
-| 7~9h | 포스터 파서·장소 매칭·검수·등록 | 업로드→등록→목록 반영 |
+| 7~9h | 포스터 파서·장소 매칭·원문 확인·번역·등록 | 등록→영문 표시, 번역 실패/재시도 |
 | 9~10.5h | 통합 오류·미확인·반응형·관리자 보호 확인 | 핵심 정상/오류 체크리스트 통과 |
 | 10.5~12h | 90초 데모, 백업 영상, 발표/비교 실험 결과 | 2회 연속 시연 성공 |
 
@@ -118,7 +120,7 @@ amp-seoul/
 1. PM+FE+BE+AI가 JSON 예시와 enums를 함께 확인. `docs/API.md`를 변경 계약의 단일 출처로 사용한다.
 2. FE는 `frontend/src/api/mockData.ts`에 **계약과 같은** 응답 fixture를 만들고 mock→실 API 교체 가능하게 구현.
 3. BE는 Pydantic 응답 스키마와 실제 SQLite 레코드를 계약에 맞게 구성. 로컬 `/docs`에서 예제 검증.
-4. AI 담당은 `SearchIntent`, `PosterExtraction` 스키마를 반환하고, Pydantic 검증/서버 기반 필터/venue 매칭을 통과시키도록 테스트.
+4. AI 담당은 `EventQuery` 도구 호출·추천 출력과 `PosterExtraction` 스키마를 연동한다. BE는 읽기 전용 조회·필수 조건 유지·ID/근거 검증·venue 매칭을 구현한다. 문장별 의도 분기나 고정 가중치 랭커를 만들지 않는다.
 5. 공통 API 필드 변경은 합의 없이 개별 코드에서 재명명하지 않는다. 예: `venue_name_detected` 금지, `extracted.venue_name` 사용.
 6. `main`은 작동하는 버전, 기능 브랜치·작은 PR·서로 다른 담당 파일 권장.
 
@@ -129,12 +131,12 @@ amp-seoul/
 - [ ] 샘플 공연 20개 이상, 공연장 4곳 이상. `DEMO` 데이터는 뱃지 표시.
 - [ ] 날짜는 KST로 처리. 지난 공연·취소/초안 공연을 공개 추천하지 않음.
 - [ ] 대표 가격 20,000원/예매 가격 20,000원·현장 25,000원이 정확히 구분됨.
-- [ ] `'좌석 공연만'`은 `seating_requirement=seated`; `mixed|null`은 제외.
-- [ ] `'좌석이면 좋겠어'`는 `seating_preference=seated`로 점수 가중치만 적용.
-- [ ] 분위기/혼자 선호를 근거 있는 속성으로만 정렬, 추천 최대 3개.
+- [ ] 문맥에 따라 AI가 좌석 필수/선호를 구분. 필수 좌석이면 `mixed|null` 제외, 선호는 후보 비교에 반영.
+- [ ] AI가 실제 DB 도구를 호출하며 원문·조회 근거로 최대 3개 추천. 고정 점수 없음.
+- [ ] 날짜 구간·출연진·설명 검색과 재조회/페이지 조회 동작. UI 필수 조건은 모든 도구 호출에 유지.
 - [ ] `doors_open_at`과 `starts_at`을 별도 라벨·시간으로 표시.
 - [ ] 장소 기본 정책과 공연별 정책/규칙을 구분하여 표시.
-- [ ] EN 토글에서 검수된 영문 안내 출력, 없으면 원문 + 미확인 표시.
+- [ ] EN 토글에서 `generated`는 자동 번역 표시·원문 보기, `reviewed`는 검수본. 번역 없으면 원문 + 번역 준비 안 됨 표시.
 
 ### P1
 - [ ] 포스터 추출이 `extracted` JSON 스키마를 준수.
@@ -142,6 +144,9 @@ amp-seoul/
 - [ ] `GET /api/venues`로 기존 공연장을 수동 선택할 수 있음.
 - [ ] 검수 체크/유효한 `venue_id` 없이 저장할 수 없음.
 - [ ] 성공 등록 201, `GET /api/events`에서 새 공연 확인, 추천 조건에 맞을 때만 추천.
+- [ ] 영어 입력 없이 최종 원문으로 제목/소개/입장/드링크 안내 자동 번역·저장.
+- [ ] 번역 실패 시 201과 `translation.status=failed`; 재시도 성공은 기존 ID에 반영.
+- [ ] null 원문, 부정/숫자/금액 보존, 원문 지문과 동시 번역 충돌 처리.
 
 ## 8. 필수 예외 테스트
 
@@ -150,8 +155,11 @@ amp-seoul/
 - [ ] 예매가·현장가 중 하나만 존재, 두 가격 동가, 대표 가격 불일치(422) 처리.
 - [ ] 공연별 좌석 미확인은 좌석 필수 조건에 일치시키지 않음.
 - [ ] 공연 시작 시각만 있을 때 입장 시각을 추정하지 않음.
-- [ ] 입구 사진·영문 정책·상세 안내 미확인은 placeholder/명확한 라벨.
-- [ ] Vision 장애 → 사용자 수동 입력; AI 추천 장애 → 수동 칩 검색 또는 오류.
+- [ ] 입구 사진·상세 안내 미확인과 영문 번역 실패는 서로 다른 라벨로 표시.
+- [ ] Vision 장애 → 수동 입력. 자연어 AI 추천 장애 → 503 후 사용자가 수동 검색 선택.
+- [ ] 모호한 요청은 확인 질문; 검색 미완료와 실제 0건 구분.
+- [ ] 도구 인자 오류/무한 호출/시간 초과, 조회되지 않은 ID/조작된 근거, 조회 후 취소를 처리.
+- [ ] DB 설명 속 지시로 필수 조건 우회·쓰기·임의 SQL 실행 불가.
 - [ ] 이미지 5MB 초과·PDF·손상·비이미지 업로드는 각각 오류.
 - [ ] 장소 미매칭·잘못된 `venue_id`·중복 `upload_id`는 등록 거절/수정 동선.
 - [ ] 등록 중 버튼 중복 클릭 방지, 실패 시 이미 입력한 필드 유지.
@@ -192,6 +200,9 @@ APP_TIMEZONE=Asia/Seoul
 CORS_ORIGINS=http://localhost:5173
 DEMO_MODE=true
 MAX_POSTER_MB=5
+AI_SEARCH_MAX_TOOL_CALLS=6
+AI_SEARCH_TIMEOUT_SECONDS=30
+AI_TRANSLATION_TIMEOUT_SECONDS=15
 
 # Frontend: 공개되어도 안전한 값만
 VITE_API_BASE_URL=http://localhost:8000
@@ -205,11 +216,15 @@ VITE_API_BASE_URL=http://localhost:8000
 
 **P0 완료:** 관객 정상 흐름 테스트, 좌석/가격/시간/미확인 예외 테스트, KO/EN 카드, 0건/오류 처리까지 검증.
 
-**P1 완료:** 이미지 추출과 장소 유일 매칭/수동 선택, 검수·등록, 목록·조건부 추천 반영과 실패 복구 검증.
+**P1 완료:** 이미지 추출과 장소 유일 매칭/수동 선택, 원문 확인·영문 생성·등록, 목록·조건부 추천 반영과 번역 실패/재시도 검증.
 
 **MVP 시연 완료:** 실제 구현 상태가 문서에 맞고 `README.md`에 재현 가능한 실행법·미구현 사항이 표시되며, 90초 흐름을 연속 두 차례 수행하고 백업 데모를 확보.
 
 ## 13. v1.1 변경 이력
+
+- 등록 번역 개정: `translator.py`, 영문 자동 생성·상태·원문 지문·재시도와 동시성 검증 추가.
+
+- 검색 설계 개정: 규칙 랭커를 AI 검색 실행기·DB 조회 도구·결과 검증기로 교체. 의도 평가와 도구 재조회/한도/장애 테스트 반영.
 
 - 우선순위 P0 관객 핵심 경험 vs P1 등록 기능으로 분리.
 - `GET /api/venues`, `venue_matcher.py`, 추천 좌석 선호/필수·가격 종류 반영.
