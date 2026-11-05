@@ -159,18 +159,24 @@ class AppliedFilters(BaseModel):
 
 
 class RecommendItem(BaseModel):
+    """AI(또는 규칙) 선택 순서의 카드. 고정 점수는 노출하지 않는다 (API.md §6)."""
+
     event: EventSummary
-    score: int
     matched_tags: list[str]
     reason: str
 
 
 class RecommendResponse(BaseModel):
+    status: Literal["ok", "needs_clarification"]
     applied_filters: AppliedFilters
-    total_matches: int
+    applied_conditions: dict[str, Any] | None  # EventQuery 식, 예: {"all": [{"field","op","value"}]}
+    preferences: list[str]
+    total_matches: int | None
     items: list[RecommendItem]
     notice: str | None
     used_fallback: bool
+    search_limited: bool
+    clarification: str | None
 
 
 # ---------- POST /api/posters/parse ----------
@@ -222,20 +228,27 @@ class EventCreate(BaseModel):
     solo_friendly: bool | None = None
     seating_type: SeatingType | None = None
     seat_assignment: SeatAssignment | None = None
-    drink_policy: str | None = Field(default=None, max_length=300)
-    description_ko: str | None = Field(default=None, max_length=2000)
+    drink_policy: str | None = Field(default=None, max_length=4000)  # DATABASE.md: 한국어 원문 최대 4,000자
+    description_ko: str | None = Field(default=None, max_length=4000)
     description_en: str | None = Field(default=None, max_length=2000)
-    admission_notes_ko: str | None = Field(default=None, max_length=2000)
+    admission_notes_ko: str | None = Field(default=None, max_length=4000)
     admission_notes_en: str | None = Field(default=None, max_length=2000)
     source_url: str | None = Field(default=None, max_length=500)
     data_origin: DataOrigin = "demo"
     review_confirmed: bool = False
 
 
+class TranslationInfo(BaseModel):
+    status: Literal["not_requested", "generated", "failed", "reviewed"]
+    generated_at: str | None
+
+
 class EventCreateResponse(BaseModel):
     id: int
     status: Literal["published"]
     poster_url: str | None
+    translation: TranslationInfo
+    warnings: list[str]
     message: str
 
 

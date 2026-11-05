@@ -23,7 +23,7 @@ import type { EventList, PosterExtraction } from '../types/api';
 
 // Read existing specification examples for contract tests; no runtime fixture/seed data is added.
 const markdown = readFileSync(new URL('../../../docs/API.md', import.meta.url), 'utf8');
-const examples = Array.from(markdown.matchAll(/```json\n([\s\S]*?)\n```/g), (match) =>
+const examples = Array.from(markdown.matchAll(/```json\r?\n([\s\S]*?)\r?\n```/g), (match) =>
   JSON.parse(match[1]),
 );
 const list = examples.find(
@@ -138,15 +138,15 @@ describe('original-only registration', () => {
 });
 
 describe('frontend-only API boundary', () => {
-  it('does not report a saved event or fabricate records before integration', async () => {
+  // Connected adapters are covered in src/api/client.test.ts. Poster extraction (AI) and translation retry (AI)
+  // are intentionally still unconnected and must not pretend to succeed or send requests.
+  it('does not fabricate extraction or translation results before integration', async () => {
     const fetch = vi.fn();
     vi.stubGlobal('fetch', fetch);
     await expect(
-      ampApi.listEvents({ upcoming: true, limit: 20, locale: 'ko' }),
+      ampApi.parsePoster(new File(['x'], 'p.png', { type: 'image/png' })),
     ).rejects.toMatchObject({ code: 'NOT_CONNECTED' });
-    await expect(
-      ampApi.createEvent(registrationPayload(emptyRegistration(), null)),
-    ).rejects.toMatchObject({ code: 'NOT_CONNECTED' });
+    await expect(ampApi.retryTranslation(1)).rejects.toMatchObject({ code: 'NOT_CONNECTED' });
     expect(fetch).not.toHaveBeenCalled();
   });
 });

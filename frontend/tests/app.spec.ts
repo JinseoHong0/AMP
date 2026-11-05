@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 
 // Existing docs examples are injected only inside isolated tests. The shipped app has no mock data.
 const markdown = readFileSync(new URL('../../docs/API.md', import.meta.url), 'utf8');
-const examples = Array.from(markdown.matchAll(/```json\n([\s\S]*?)\n```/g), (match) =>
+const examples = Array.from(markdown.matchAll(/```json\r?\n([\s\S]*?)\r?\n```/g), (match) =>
   JSON.parse(match[1]),
 );
 const recommendation = examples.find((item) => item.status === 'ok' && item.items?.[0]?.event);
@@ -44,6 +44,8 @@ test('frontend-only navigation, search filters and unavailable state are honest'
   page.on('request', (request) => {
     if (request.url().includes('localhost:8000')) apiRequests.push(request.url());
   });
+  // The listings adapter is connected; simulate an unreachable backend to keep this test about honest failure.
+  await page.route('http://localhost:8000/**', (route) => route.abort('connectionrefused'));
   await page.goto('/');
   await expect(page.getByRole('heading', { level: 1 })).toContainText('오늘의 나에게');
   await page.screenshot({ path: `test-results/home-${info.project.name}.png`, fullPage: true });
@@ -67,7 +69,11 @@ test('frontend-only navigation, search filters and unavailable state are honest'
     true,
   );
   expect(exceptions).toEqual([]);
-  expect(apiRequests).toEqual([]);
+  // Only the connected endpoints this flow uses were attempted (recommend, then listings KO/EN).
+  const paths = apiRequests.map((url) => new URL(url).pathname);
+  expect(paths).toContain('/api/recommend');
+  expect(paths).toContain('/api/events');
+  expect(paths.every((path) => path === '/api/recommend' || path === '/api/events')).toBe(true);
 });
 
 test('recommendation, detail, AI translation and original view follow existing API examples', async ({

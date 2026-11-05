@@ -260,6 +260,15 @@ VENUE_TABLE: dict[str, tuple[str, list[str]]] = {
     "Joons 준스바": ("hongdae", ["Joons 준스바 (서울 마포구 와우산로19길 6-11 지하 1층"]),
     "스페이스 브릭": ("hongdae", ["서울 마포구 잔다리로 31 지하2층 '스페이스 브릭'"]),
 }
+# 데이터에 **명시된** 주소·층수만 (공연장 열 또는 추출본 문장 그대로). 없거나 잘린 주소는 NULL 로 둔다.
+VENUE_DETAILS: dict[str, tuple[str, str | None]] = {
+    "클럽에반스": ("서울시 마포구 와우산로 63 2층", "2F"),
+    "아지토 라이브홀": ("서울 서대문구 신촌역로 13 세오빌딩 지하", None),
+    "스팀펑크락": ("서대문구 연세로9길 13", None),
+    "구름아래소극장": ("서울특별시 마포구 와우산로29가길 15", None),
+    "Joons 준스바": ("서울 마포구 와우산로19길 6-11 지하 1층", "B1"),
+    "스페이스 브릭": ("서울 마포구 잔다리로 31 지하2층", "B2"),
+}
 _VENUE_ALIASES: dict[str, str] = {}
 for _canon, (_area, _aliases) in VENUE_TABLE.items():
     for _alias in [_canon, *_aliases]:
@@ -466,10 +475,11 @@ def import_dataset(
             venue_ids[name] = row["id"]
         else:
             venue_page = source_url if source_url and "/venues/" in source_url else None
+            address, floor = VENUE_DETAILS.get(name, (None, None))
             cur = conn.execute(
-                "INSERT INTO venues (name, area, source_url, verified_at_utc, data_origin) "
-                "VALUES (?, ?, ?, NULL, 'verified')",
-                (name, VENUE_TABLE[name][0], venue_page),
+                "INSERT INTO venues (name, area, address, floor, source_url, verified_at_utc, data_origin) "
+                "VALUES (?, ?, ?, ?, ?, NULL, 'verified')",
+                (name, VENUE_TABLE[name][0], address, floor, venue_page),
             )
             venue_ids[name] = cur.lastrowid
             report.venues_created += 1
