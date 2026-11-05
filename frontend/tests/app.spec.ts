@@ -236,24 +236,18 @@ test('the separate listings page loads without a query and is not capped at thre
   );
 });
 
-test('real image preview uses the selected file and a specified extraction fills only original fields', async ({
+test('real multipart upload uses the selected image and fills only original fields', async ({
   page,
 }) => {
   await page.goto('/');
   await injectReadContracts(page);
-  await page.evaluate(async (example) => {
-    // Use the module actually loaded by Vite, including its HMR version query.
-    const path =
-      performance
-        .getEntriesByType('resource')
-        .find((entry) => new URL(entry.name).pathname === '/src/api/client.ts')?.name ||
-      '/src/api/client.ts';
-    const { ampApi } = await import(/* @vite-ignore */ path);
-    ampApi.parsePoster = async (file: File) => {
-      (window as unknown as { uploadedName: string }).uploadedName = file.name;
-      return example;
-    };
-  }, extraction);
+  let uploaded = '';
+  await page.route('**/api/posters/parse', async (route) => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().headers()['content-type']).toContain('multipart/form-data; boundary=');
+    uploaded = route.request().postDataBuffer()?.toString() || '';
+    await route.fulfill({ json: extraction });
+  });
   // Use a screenshot of the actual wordmark, not a fabricated concert asset.
   const image = await page.locator('.wordmark').screenshot();
   await page.locator('nav:visible').getByRole('link', { name: '공연 등록', exact: true }).click();
@@ -266,7 +260,32 @@ test('real image preview uses the selected file and a specified extraction fills
   await expect(page.locator('#form-review_confirmed')).not.toBeChecked();
   await expect(page.locator('#form-venue_id')).toHaveValue(String(extraction.venue_match.venue_id));
   await expect(page.locator('input[name="title_en"]')).toHaveCount(0);
-  expect(
-    await page.evaluate(() => (window as unknown as { uploadedName: string }).uploadedName),
-  ).toBe('wordmark.png');
+  expect(uploaded).toContain('name="file"; filename="wordmark.png"');
+});
+
+test('AI quota failure keeps the preview and offers manual entry without claiming success', async ({
+  page,
+}) => {
+  await page.goto('/');
+  const image = await page.locator('.wordmark').screenshot();
+  await page.route('**/api/posters/parse', (route) =>
+    route.fulfill({
+      status: 503,
+      json: { error: { code: 'AI_UNAVAILABLE', message: 'AI unavailable', details: {} } },
+    }),
+  );
+  await page.locator('nav:visible').getByRole('link', { name: '공연 등록', exact: true }).click();
+  await page
+    .getByLabel('포스터 이미지 선택')
+    .setInputFiles({ name: 'wordmark.png', mimeType: 'image/png', buffer: image });
+  await expect(page.getByAltText('선택한 포스터 미리보기')).toBeVisible();
+  await page.getByRole('button', { name: '포스터에서 정보 가져오기' }).click();
+  await expect(page.getByRole('heading', { name: 'AI 요청을 완료하지 못했어요.' })).toBeVisible();
+  await expect(page.getByAltText('선택한 포스터 미리보기')).toBeVisible();
+  await page.getByRole('button', { name: '포스터 없이 직접 입력하기' }).click();
+  await expect(page.locator('#form-title')).toBeEmpty();
+  await expect(
+    page.getByText('이미지 추출이 완료되지 않아 포스터 없이 수동 등록됩니다.'),
+  ).toBeVisible();
+  await expect(page.locator('#form-review_confirmed')).not.toBeChecked();
 });

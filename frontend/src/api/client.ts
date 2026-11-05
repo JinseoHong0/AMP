@@ -18,20 +18,58 @@ export class ApiError extends Error {
     public code: string,
     message: string,
     public status = 0,
+    public details: Record<string, unknown> = {},
   ) {
     super(message);
   }
 }
 
 /**
- * BACKEND_TODO: Replace only these adapters with authenticated HTTP calls in the next phase.
- * No fetch, fake records, local ranking, image recognition or simulated success is provided here.
- * Map { error: { code, message, details } } to ApiError; preserve 404/422/503 semantics.
- * Use VITE_API_BASE_URL, AbortSignal/timeouts and backend-provided admin credentials when wired.
+ * Poster parsing uses the real backend. Other adapters remain explicit integration boundaries.
+ * No runtime fake records or simulated success are provided.
+ * BACKEND_TODO: Add authenticated HTTP calls for the remaining endpoints.
  * Read README first: AI chooses recommendation order; English is generated only at registration.
  */
 function unavailable<T>(): Promise<T> {
   return Promise.reject(new ApiError('NOT_CONNECTED', 'The service is not connected yet.'));
+}
+
+async function parsePoster(file: File): Promise<PosterExtraction> {
+  const origin = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
+  const body = new FormData();
+  body.append('file', file);
+  const controller = new AbortController();
+  // Allows the backend's configurable <=60s model timeout plus image upload/validation.
+  const timeout = setTimeout(() => controller.abort(), 75_000);
+  try {
+    const response = await fetch(`${origin}/api/posters/parse`, {
+      method: 'POST',
+      body,
+      signal: controller.signal,
+      // The browser supplies Content-Type with the multipart boundary. No API key is sent.
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new ApiError(
+        payload?.error?.code || 'HTTP_ERROR',
+        payload?.error?.message || 'Poster extraction failed.',
+        response.status,
+        payload?.error?.details || {},
+      );
+    }
+    if (!payload?.upload_id || !payload.extracted || !payload.venue_match) {
+      throw new ApiError('INVALID_RESPONSE', 'The extraction response is incomplete.');
+    }
+    return payload as PosterExtraction;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(
+      controller.signal.aborted ? 'REQUEST_TIMEOUT' : 'NETWORK_ERROR',
+      controller.signal.aborted ? 'Poster extraction timed out.' : 'Cannot reach the backend.',
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export const ampApi = {
@@ -47,9 +85,8 @@ export const ampApi = {
   getVenue: (_id: number, _locale: Locale): Promise<Venue> => unavailable(),
   // BACKEND_TODO: POST /api/recommend JSON. Keep AI order, clarification and search limits.
   recommend: (_request: RecommendRequest): Promise<Recommendations> => unavailable(),
-  // BACKEND_TODO: POST /api/posters/parse, FormData key=file; let the browser set multipart headers.
-  // Normalize legacy README venue_name_detected here if needed; current API uses extracted.venue_name.
-  parsePoster: (_file: File): Promise<PosterExtraction> => unavailable(),
+  // POST /api/posters/parse. Existing-venue matching happens on the server; this does not save an event.
+  parsePoster,
   // BACKEND_TODO: POST /api/events JSON; HTTP 201 remains success when only translation fails.
   createEvent: (_request: CreateEventRequest): Promise<CreatedEvent> => unavailable(),
   // BACKEND_TODO: POST /api/events/{id}/translate, NO body. Never re-create the event on retry.
