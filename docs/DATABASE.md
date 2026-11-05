@@ -12,7 +12,7 @@
 5. 행사마다 다른 예매가·현장가를 구분한다. 기존 `price_krw`는 **검색용 대표 가격**으로 유지한다.
 6. `verified`(출처·확인 과정 있는 실제 정보)와 `demo`(가상 시연 데이터)를 구분하고, `demo`는 UI에 표시한다.
 7. DB 시각은 **UTC ISO 8601 문자열(`YYYY-MM-DDTHH:MM:SSZ`)**로 저장한다. 상대 날짜와 표시는 `Asia/Seoul`을 기준으로 한다.
-8. 설명과 번역은 **검수된 텍스트만** 저장한다. 입구 사진·좌석·안전·관람 규칙을 모델이 추측하지 않는다.
+8. 공연 원문은 등록자가 확인하고, 영문은 등록 시 자동 생성해 번역 상태와 함께 저장한다. 원문에 없는 입구·좌석·안전·관람 규칙을 추가하지 않는다. 장소의 기존 영문은 사전 검수본을 유지한다.
 
 ## 2. ERD
 
@@ -40,6 +40,7 @@ erDiagram
         integer id PK
         integer venue_id FK
         text title
+        text title_en
         text starts_at_utc
         text ends_at_utc
         text doors_open_at_utc
@@ -55,6 +56,10 @@ erDiagram
         text seating_type
         text seat_assignment
         text drink_policy
+        text drink_policy_en
+        text translation_status
+        text translation_source_hash
+        text translated_at_utc
         text description_ko
         text description_en
         text admission_notes_ko
@@ -95,7 +100,8 @@ erDiagram
 |---|---|---|
 | `id` | INTEGER PK | 이벤트 ID |
 | `venue_id` | INTEGER NOT NULL FK | 반드시 기존 공연장 선택 |
-| `title` | TEXT NOT NULL | 1~120자(애플리케이션 검증) |
+| `title` | TEXT NOT NULL | 원문 공연명 1~120자 |
+| `title_en` | TEXT NULL | 등록 시 자동 생성하는 영문 제목, 최대 500자 |
 | `starts_at_utc`, `ends_at_utc` | TEXT / 종료 NULL | 공연 시작·종료 UTC |
 | `doors_open_at_utc` | TEXT NULL **v1.1 추가** | 입장 시작 시각 UTC |
 | `price_krw` | INTEGER NULL, >=0 | 검색용 대표 가격. 아래 규칙으로 산출 |
@@ -109,9 +115,13 @@ erDiagram
 | `solo_friendly` | INTEGER NULL/0/1 | 근거가 있을 때만 혼자 방문 적합성 표시 |
 | `seating_type` | TEXT NULL | `standing`, `seated`, `mixed` |
 | `seat_assignment` | TEXT NULL **추가** | `assigned`(지정석), `unassigned`(비지정석) |
-| `drink_policy` | TEXT NULL | 해당 공연 드링크 규정 |
+| `drink_policy` | TEXT NULL | 해당 공연 드링크 규정 한국어 원문, 최대 4,000자 |
+| `drink_policy_en` | TEXT NULL | 자동 번역, 최대 12,000자 |
 | `description_ko`, `description_en` | TEXT NULL | 공연 소개 |
-| `admission_notes_ko`, `admission_notes_en` | TEXT NULL **추가** | 입장·선착순·관람 유의 사항; 영어는 검수본만 |
+| `admission_notes_ko`, `admission_notes_en` | TEXT NULL **추가** | 한국어 입장 안내와 등록 시 자동 생성하는 영어 번역 |
+| `translation_status` | TEXT NOT NULL | `not_requested`(기본), `generated`, `failed`, `reviewed` |
+| `translation_source_hash` | TEXT NULL | 번역에 사용한 정규화 원문 지문(SHA-256), API에 노출하지 않음 |
+| `translated_at_utc` | TEXT NULL | 성공한 번역 생성 시각 UTC |
 | `poster_image_path` | TEXT NULL | 사용 권리가 있는 포스터 경로 |
 | `status` | TEXT NOT NULL | `draft`, `published`, `cancelled` |
 | `data_origin` | TEXT NOT NULL | `verified` / `demo` |
@@ -163,6 +173,7 @@ CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     venue_id INTEGER NOT NULL REFERENCES venues(id),
     title TEXT NOT NULL,
+    title_en TEXT,
     starts_at_utc TEXT NOT NULL,
     ends_at_utc TEXT,
     doors_open_at_utc TEXT,
@@ -178,6 +189,10 @@ CREATE TABLE IF NOT EXISTS events (
     seating_type TEXT CHECK (seating_type IS NULL OR seating_type IN ('standing','seated','mixed')),
     seat_assignment TEXT CHECK (seat_assignment IS NULL OR seat_assignment IN ('assigned','unassigned')),
     drink_policy TEXT,
+    drink_policy_en TEXT,
+    translation_status TEXT NOT NULL DEFAULT 'not_requested' CHECK (translation_status IN ('not_requested','generated','failed','reviewed')),
+    translation_source_hash TEXT,
+    translated_at_utc TEXT,
     description_ko TEXT,
     description_en TEXT,
     admission_notes_ko TEXT,
@@ -209,7 +224,7 @@ DDL의 가격 산출 동기화·날짜 비교·URL 유효성 검사는 **백엔�
 - `upcoming=true`는 `starts_at_utc >= now_utc`를 적용한다. 지난 공연·`cancelled`·`draft`는 공개 추천에 포함하지 않는다.
 - 검수 시 `doors_open_at_utc <= starts_at_utc`, `ends_at_utc > starts_at_utc`를 확인한다(각 값이 있는 경우).
 
-### 추천 하드 필터(개념 SQL)
+### AI 조회 도구의 필수 조건 실행(개념 SQL)
 
 ```sql
 SELECT e.*
@@ -224,14 +239,17 @@ WHERE e.status = 'published'
   AND (:seating_requirement IS NULL OR e.seating_type = :seating_requirement);
 ```
 
-**엄격한 좌석 조건**에는 `events.seating_type`이 명확히 기록된 경우만 일치시킨다. 장소의 `default_seating_type`만으로 '좌석 확정'이라고 판단하지 않는다. 소프트 선호는 하드 필터 후 Python 랭커가 반영한다.
+**엄격한 좌석 조건**에는 `events.seating_type`이 명확히 기록된 경우만 일치시킨다. 장소의 `default_seating_type`만으로 '좌석 확정'이라고 판단하지 않는다.
 
-### 추천 점수(개발 전 합의안)
-- 검수된 `mood_tags` 일치당 +40점 (중복 제거).
-- `solo_friendly=true` 선호가 있고 값이 실제 true이면 +20점.
-- `seating_preference`와 **이벤트의 명시 `seating_type`**이 일치하면 +20점.
-- 정렬 순서: 점수 내림차순 → 시작일 오름차순 → 이벤트 ID 오름차순.
-- 날짜/지역/가격/`seating_requirement`는 점수화하지 않고 먼저 제외한다.
+위 SQL은 필수 조건 실행 예시다. 실제 조회는 [AI.md](./AI.md)의 `EventQuery` 허용 필드·타입·연산을 검증해 파라미터 바인딩으로 조립한다. AI가 날짜 범위·가격·지역 외에도 제목·출연진·설명·장르 등으로 검색하고 결과를 보고 재조회할 수 있다. 검색 방식 변경 자체에는 추가 테이블이 필요하지 않으며, 등록 번역용 컬럼은 위 DDL에 포함한다.
+
+### AI 조회와 추천의 책임
+
+- 서버가 공개·미래 공연, UI 필수 필터, 최초 조회에서 확정한 필수 조건을 모든 재조회에 강제한다.
+- 조회 도구는 읽기 전용으로 실행하며 `starts_at_utc ASC, id ASC` 순서와 서버 발급 커서로 페이지를 반환한다. 검색 범위를 바꾸면 커서를 초기화한다.
+- AI는 원문과 조회된 설명·태그·좌석 등으로 비교하고 추천 순서를 결정한다. Python 고정 가중치 점수는 사용하지 않는다.
+- 추천 직전에 ID·공개 상태·필수 조건·근거 데이터를 재검사한다. 모델이 만든 가격/좌석 값을 DB 사실 대신 반환하지 않는다.
+- `total_matches`는 확정된 필수 조건 전체 일치 건수이고, 탐색 키워드 결과 건수나 AI가 선택한 개수와 구분한다.
 
 ## 8. 장소/입장 가이드 표시 정책
 
@@ -240,8 +258,20 @@ WHERE e.status = 'published'
 - `events.doors_open_at_utc`가 없으면 입장 시간 미확인으로 표시한다. 공연 시작 시각을 입장 시각으로 복제하지 않는다.
 - `events.seat_assignment`와 '선착순 입장'(`admission_notes_*`)을 따로 표시한다.
 - 장소 입구 방향은 `entrance_hint_*`; 해당 공연 특이사항은 `admission_notes_*`에 표시한다. 상호 대체하지 않는다.
-- 영어 필드가 없으면 한국어 원문과 `English guidance not confirmed`를 표시한다. 즉석 AI 번역으로 임의 규칙을 만들지 않는다.
+- 공연 영문은 원문 지문이 일치하는 `generated|reviewed` 상태만 표시한다. `generated`에는 `AI-translated`와 원문 보기 제공; `reviewed`는 실제 영어 검수가 확인된 시드/관리 데이터에만 사용한다.
+- 영문이 없거나 번역 실패/원문 변경 상태이면 해당 한국어 원문과 `영문 번역 준비 안 됨`을 표시한다. 필드 자체가 원문에도 없으면 정보 미확인으로 표시한다. 장소의 기존 영문 표시 정책은 유지한다.
 - 정보의 출처/검증일이 없거나 `data_origin=demo`이면 각각 미확인/DEMO로 표시한다.
+
+### 등록 번역의 저장 계약
+
+- `description_ko`/`admission_notes_ko`는 최대 4,000자, 대응 영문은 최대 12,000자. 길이·공백 정규화·번역 무결성은 서비스 계층에서 검증한다.
+- 번역 대상은 `title`, `description_ko`, `admission_notes_ko`, `drink_policy`다. 등록 요청에는 영문/번역 상태를 받지 않는다.
+- `generated|reviewed`: 원문 지문과 생성 시각 필수, 원문이 있는 필드의 번역 필수. `failed`: 시도한 원문 지문은 기록하고 영문 전체와 생성 시각은 NULL. `not_requested`: 영문·지문·생성 시각 모두 NULL.
+- 최초 등록은 원문과 번역 결과를 함께 저장한다. 번역만 실패하면 `failed`로 정상 등록한다. DB 저장 실패를 성공 응답으로 바꾸지 않는다.
+- 번역 재시도는 원문 지문을 저장 직전에 비교하고 같은 원문일 때만 갱신한다. 같은 지문의 정상 번역은 재사용하고, 동시 성공을 늦은 실패가 덮어쓰지 않는다.
+- 원문 수정 시 기존 번역 묶음을 비우고 `not_requested`로 전환한다. 성공 번역 시 네 영문 필드·지문·생성 시각·상태를 원자적으로 갱신한다.
+- 시드의 검수 영문은 `reviewed`와 지문·생성 시각을 명시한다. `data_origin=verified`나 원문 검수 여부만으로 영어까지 `reviewed`라고 표시하지 않는다.
+- 현재는 개발 전 DDL 변경이다. 기존 DB에 적용할 때 `CREATE TABLE IF NOT EXISTS`는 컬럼을 추가하지 않으므로 별도 마이그레이션이 필요하다.
 
 ## 9. 공연장 매칭 정책 (앱 로직)
 
@@ -261,6 +291,8 @@ WHERE e.status = 'published'
 - 외부 배포 시에는 DB와 업로드 이미지의 영구 스토리지를 구성하고 관리자 인증을 적용한다.
 
 ## 11. 변경 이력 v1.0 → v1.1
+
+- 등록 번역 개정: `title_en`, `drink_policy_en`, 번역 상태·원문 지문·생성 시각 추가. 기존 설명/입장 안내 영문은 자동 생성값 저장에 재사용.
 
 - 기존 `events`/`venues` 관계와 기존 필드 유지.
 - 공연별 입장 시각, 예매/현장가, 검색 기준 가격 출처, 예매 링크, 좌석 배정, 한·영 방문 안내 추가.
