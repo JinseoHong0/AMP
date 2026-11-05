@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Local environment variables (keep shared templates)
+.env
+.env.*
+!.env.example
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime database and temporary uploads
+/backend/data/
+/backend/uploads/
+
+# Local logs
+*.log
