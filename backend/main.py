@@ -3,27 +3,28 @@
 실행 (backend/ 에서):
     python -m venv .venv && .venv\\Scripts\\activate      # macOS·Linux: source .venv/bin/activate
     pip install -r requirements.txt
-    python seed.py                     # DEMO 시드 (멱등). --reset --base-date YYYY-MM-DD 로 재생성
+    python seed.py                     # 엑셀 데이터셋 적재 (--demo: 가상 DEMO 시드, --reset 재생성)
     uvicorn main:app --reload --host 127.0.0.1 --port 8000
-    python -m pytest                   # 테스트
+    python -m pytest                   # 테스트 (가짜 Gemini 사용, 실제 키로 외부 호출하지 않음)
 
 모듈 구성 (docs/DEVELOPMENT.md §3):
     main.py      앱 생성, CORS, 공통 오류 핸들러, /api/health, /media
-    database.py  설정(.env), SQLite 연결/스키마, 요청 의존성(get_db, require_admin)
-    models.py    도메인 상수·오류, KST↔UTC, 가격 산출, row→JSON, 하드 필터 쿼리
+    database.py  설정(.env), SQLite 연결/스키마·마이그레이션, 요청 의존성(get_db, require_admin)
+    models.py    도메인 상수·오류, KST↔UTC, 가격 산출, row→JSON, 번역 지문, 하드 필터 쿼리
     schemas.py   Pydantic 요청/응답, ApiError
-    seed.py      DEMO 시드
-    routers/     events · venues · recommend · posters(포스터 분석 + 번역 초안)
-    services/    intent(LLM 직접 추천) · ranker · reason(이유 + 번역) · poster_parser(+업로드) · venue_matcher
+    seed.py      데이터 적재 (엑셀 / DEMO)
+    routers/     events(+등록·번역 재시도) · venues · recommend · posters(포스터 분석)
+    services/    intent(AI 도구 호출 검색·추천) · ranker · reason(Gemini 호출·이유·등록 번역)
+                 · poster_parser(Vision 추출+업로드) · venue_matcher
 
-AI 연결은 현재 공란이다. services/intent.py `call_llm_recommend`, services/reason.py `call_llm_translate`,
-services/poster_parser.py `call_llm_poster` 본문만 채우면 된다. 미연결 시 동작:
-    - 추천: 검색어만 있으면 503 AI_UNAVAILABLE, 필터 칩이 있으면 규칙 기반 + used_fallback=true
-    - 번역: 503 → 영문 직접 입력 / 포스터: 503 → 수동 등록(upload_id=null)
-
-docs/ 명세와 달라진 점 (팀 공유 필요):
-    - 추천: LLM 이 후보 선택·순서를 결정, 서버는 ID·하드 조건·이유 문장만 검증 (AI.md §1·§4·§5)
-    - 번역: 홍보 문구(description_ko)에 한해 AI 번역 초안 제공, 검수 후 저장 / POST /api/translate 신규
+AI (Google Gemini, `.env` 의 LLM_PROVIDER=gemini · LLM_MODEL · LLM_API_KEY, docs/AI.md):
+    - 추천: 자연어 query → AI 가 search_events/get_event_details 도구로 조회·재조회 후 최대 3개 제출,
+      서버가 ID·필수 조건·근거를 검증. AI 실패 시 503 AI_UNAVAILABLE (필터 결과로 대체하지 않음).
+      query 없이 필터만 → AI 없이 시간순 + used_fallback=true
+    - 등록 번역: POST /api/events 저장 전 원문 4필드 → 영문 자동 생성(15초·재시도 1회). 실패해도 201 + failed,
+      POST /api/events/{id}/translate 로 재시도
+    - 포스터: POST /api/posters/parse → Vision 추출, 공연장은 서버가 이름 정규화로 매칭. 실패 시 503 → 수동 등록
+    - 공급자 일시 장애(429·500·503)는 추천·포스터에서 각 시간 한도 안에서만 짧게 재시도한다.
 """
 from __future__ import annotations
 

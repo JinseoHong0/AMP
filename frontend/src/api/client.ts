@@ -24,22 +24,21 @@ export class ApiError extends Error {
 }
 
 /**
- * BACKEND_TODO: Replace only these adapters with authenticated HTTP calls in the next phase.
- * No fetch, fake records, local ranking, image recognition or simulated success is provided here.
- * Map { error: { code, message, details } } to ApiError; preserve 404/422/503 semantics.
- * Use VITE_API_BASE_URL, AbortSignal/timeouts and backend-provided admin credentials when wired.
- * Read README first: AI chooses recommendation order; English is generated only at registration.
+ * HTTP adapters for the FastAPI backend (docs/API.md). No fake records, local ranking, image recognition
+ * or simulated success: every value shown comes from the server. `{ error: { code, message, details } }`
+ * maps to ApiError with the HTTP status so 404/422/503 keep their meaning in the UI.
+ * AI chooses recommendation order; English is generated only at registration (server-side).
  */
-function unavailable<T>(): Promise<T> {
-  return Promise.reject(new ApiError('NOT_CONNECTED', 'The service is not connected yet.'));
-}
-
 /** Same origin source as `format.ts` media URLs. Trailing slashes are trimmed. */
 export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(
   /\/+$/,
   '',
 );
 const DEFAULT_TIMEOUT_MS = 15_000;
+// Server-side AI budgets (docs/AI.md): recommend 30s, registration translation 15s, poster extraction 40s.
+const RECOMMEND_TIMEOUT_MS = 35_000;
+const TRANSLATION_TIMEOUT_MS = 30_000;
+const POSTER_TIMEOUT_MS = 50_000;
 
 interface RequestOptions extends Omit<RequestInit, 'signal'> {
   timeoutMs?: number;
@@ -116,20 +115,33 @@ export const ampApi = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      timeoutMs: 35_000,
+      timeoutMs: RECOMMEND_TIMEOUT_MS,
     }),
-  // BACKEND_TODO: POST /api/posters/parse, FormData key=file; let the browser set multipart headers.
-  // Normalize legacy README venue_name_detected here if needed; current API uses extracted.venue_name.
-  parsePoster: (_file: File): Promise<PosterExtraction> => unavailable(),
+  // POST /api/posters/parse, FormData key=file. No Content-Type header: the browser sets the multipart boundary.
+  // The API returns extracted.venue_name (no legacy venue_name_detected alias to normalize).
+  parsePoster: (file: File): Promise<PosterExtraction> => {
+    const form = new FormData();
+    form.append('file', file);
+    return request('/api/posters/parse', {
+      method: 'POST',
+      body: form,
+      timeoutMs: POSTER_TIMEOUT_MS,
+    });
+  },
   // POST /api/events JSON (admin; local backend allows loopback without a key — never ship an admin key in VITE_*).
-  // HTTP 201 remains success when only translation fails/is pending: the UI must not submit twice.
+  // HTTP 201 remains success when only translation fails: the UI must not submit twice.
+  // The server translates before saving (up to 15s), so this call allows longer than the default timeout.
   createEvent: (body: CreateEventRequest): Promise<CreatedEvent> =>
     request('/api/events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      timeoutMs: TRANSLATION_TIMEOUT_MS,
     }),
-  // BACKEND_TODO: POST /api/events/{id}/translate, NO body. Never re-create the event on retry.
-  retryTranslation: (_id: number): Promise<{ id: number; translation: Translation }> =>
-    unavailable(),
+  // POST /api/events/{id}/translate with NO body. Reuses the saved original; never re-creates the event.
+  retryTranslation: (id: number): Promise<{ id: number; translation: Translation }> =>
+    request(`/api/events/${encodeURIComponent(String(id))}/translate`, {
+      method: 'POST',
+      timeoutMs: TRANSLATION_TIMEOUT_MS,
+    }),
 };

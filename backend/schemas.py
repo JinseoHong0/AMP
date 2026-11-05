@@ -44,6 +44,11 @@ class ErrorResponse(BaseModel):
 
 
 # ---------- 공통 ----------
+class TranslationInfo(BaseModel):
+    status: Literal["not_requested", "generated", "failed", "reviewed"]
+    generated_at: str | None
+
+
 class VenueSummary(BaseModel):
     id: int
     name: str
@@ -53,6 +58,8 @@ class VenueSummary(BaseModel):
 class EventSummary(BaseModel):
     id: int
     title: str
+    title_en: str | None
+    translation: TranslationInfo
     starts_at: str
     price_krw: int | None
     price_basis: PriceBasis | None
@@ -77,6 +84,8 @@ class EventDetail(BaseModel):
     id: int
     venue_id: int
     title: str
+    title_en: str | None
+    translation: TranslationInfo
     starts_at: str
     ends_at: str | None
     doors_open_at: str | None
@@ -92,6 +101,7 @@ class EventDetail(BaseModel):
     seating_type: SeatingType | None
     seat_assignment: SeatAssignment | None
     drink_policy: str | None
+    drink_policy_en: str | None
     description_ko: str | None
     description_en: str | None
     admission_notes_ko: str | None
@@ -230,17 +240,12 @@ class EventCreate(BaseModel):
     seat_assignment: SeatAssignment | None = None
     drink_policy: str | None = Field(default=None, max_length=4000)  # DATABASE.md: 한국어 원문 최대 4,000자
     description_ko: str | None = Field(default=None, max_length=4000)
-    description_en: str | None = Field(default=None, max_length=2000)
     admission_notes_ko: str | None = Field(default=None, max_length=4000)
-    admission_notes_en: str | None = Field(default=None, max_length=2000)
+    # 영문(title_en·description_en·admission_notes_en·drink_policy_en)·번역 메타데이터는 서버 생성 전용 →
+    # extra="forbid" 로 요청에 포함하면 422 (API.md §8 검증 6)
     source_url: str | None = Field(default=None, max_length=500)
     data_origin: DataOrigin = "demo"
     review_confirmed: bool = False
-
-
-class TranslationInfo(BaseModel):
-    status: Literal["not_requested", "generated", "failed", "reviewed"]
-    generated_at: str | None
 
 
 class EventCreateResponse(BaseModel):
@@ -252,15 +257,6 @@ class EventCreateResponse(BaseModel):
     message: str
 
 
-# ---------- POST /api/translate (관리자, 번역 초안) ----------
-class TranslateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    text_ko: str = Field(min_length=1, max_length=2000)
-    target_locale: Literal["en"] = "en"
-
-
-class TranslateResponse(BaseModel):
-    text_en: str
-    needs_review: bool
-    notice: str
+class TranslationRetryResponse(BaseModel):
+    id: int
+    translation: TranslationInfo

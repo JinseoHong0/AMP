@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 EVENT_SUMMARY_KEYS = {
-    "id", "title", "starts_at", "price_krw", "price_basis", "advance_price_krw", "door_price_krw",
+    "id", "title", "title_en", "translation", "starts_at", "price_krw", "price_basis", "advance_price_krw", "door_price_krw",
     "genre", "mood_tags", "seating_type", "poster_url", "venue", "data_origin",
 }
 EVENT_DETAIL_KEYS = {
-    "id", "venue_id", "title", "starts_at", "ends_at", "doors_open_at", "price_krw", "price_basis",
+    "id", "venue_id", "title", "title_en", "translation", "starts_at", "ends_at", "doors_open_at", "price_krw", "price_basis",
     "advance_price_krw", "door_price_krw", "booking_url", "lineup", "genre", "mood_tags", "solo_friendly",
-    "seating_type", "seat_assignment", "drink_policy", "description_ko", "description_en",
+    "seating_type", "seat_assignment", "drink_policy", "drink_policy_en", "description_ko", "description_en",
     "admission_notes_ko", "admission_notes_en", "poster_url", "status", "data_origin", "source_url",
     "verified_at",
 }
@@ -181,3 +181,45 @@ def test_media_url_mapping():
     assert media_url(None) is None
     assert media_url("posters/1.webp") == "/media/posters/1.webp"
     assert media_url("https://cdn.example.com/a.jpg") == "https://cdn.example.com/a.jpg"
+
+
+# ---------- 번역 노출 규칙 (DATABASE.md §8) ----------
+def test_reviewed_translation_is_exposed_with_status(client, db):
+    body = client.get(f"/api/events/{_event_id(db, '밤의 산책')}").json()
+    assert body["translation"]["status"] == "reviewed" and body["translation"]["generated_at"]
+    assert body["title_en"] == "Night Walk"
+    assert body["drink_policy_en"] == "Please check the guidance for this event."
+    assert body["admission_notes_en"].startswith("Unassigned seating")
+    card = next(i for i in client.get("/api/events", params={"date": "2026-11-07", "limit": 50}).json()["items"]
+                if i["title"] == "밤의 산책")
+    assert card["title_en"] == "Night Walk" and card["translation"]["status"] == "reviewed"
+
+
+def test_incomplete_english_is_not_exposed(client, db):
+    # 기타 솔로 리사이틀: 입장 안내 영문은 있으나 소개 영문이 없어 묶음이 불완전 → 영문 전체 비노출
+    body = client.get(f"/api/events/{_event_id(db, '기타 솔로 리사이틀')}").json()
+    assert body["translation"] == {"status": "not_requested", "generated_at": None}
+    assert body["title_en"] is None and body["admission_notes_en"] is None
+
+
+def test_stale_translation_hidden_after_source_change(client, db):
+    eid = _event_id(db, "밤의 산책")
+    db.execute("UPDATE events SET description_ko = '원문이 바뀌었습니다.' WHERE id = ?", (eid,))
+    db.commit()
+    body = client.get(f"/api/events/{eid}").json()
+    assert body["translation"] == {"status": "not_requested", "generated_at": None}
+    assert body["title_en"] is None and body["description_en"] is None and body["drink_policy_en"] is None
+
+
+def test_source_hash_contract():
+    from models import translation_source_hash
+
+    a = translation_source_hash({"title": "t", "description_ko": None, "admission_notes_ko": None,
+                                 "drink_policy": "d"})
+    b = translation_source_hash({"drink_policy": "d", "admission_notes_ko": None, "description_ko": None,
+                                 "title": "t"})
+    import hashlib
+
+    expected = hashlib.sha256('{"admission_notes_ko":null,"description_ko":null,"drink_policy":"d","title":"t"}'
+                              .encode("utf-8")).hexdigest()
+    assert a == b == expected

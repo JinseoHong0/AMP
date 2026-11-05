@@ -1,23 +1,23 @@
-"""3단계: POST /api/recommend — LLM 직접 추천 + 서버 검증, AI 장애 시 규칙 기반 복구.
-
-AI 연결은 공란이므로 LLM 응답이 필요한 경우 테스트에서 services.intent.call_llm_recommend 를 가짜로 바꿔 끼운다.
-"""
+"""3단계: POST /api/recommend — AI 도구 호출 검색·추천(가짜 Gemini) + 필터만 경로 + EventQuery 조건식."""
 from __future__ import annotations
+
+import json
 
 import pytest
 
-from services import intent
+from conftest import fc, function_responses
 
-DOC_FILTERS = {
-    "date_expression": "2026-11-07",
-    "area": "sinchon",
-    "max_price_krw": 20000,
-    "mood_tags": ["calm"],
-    "solo_friendly": True,
-    "seating_preference": None,
-    "seating_requirement": "seated",
-}
+DAY = [
+    {"field": "starts_at", "op": "gte", "value": "2026-11-07T00:00:00+09:00"},
+    {"field": "starts_at", "op": "lt", "value": "2026-11-08T00:00:00+09:00"},
+]
+DOC_REQUIRED = {"all": [*DAY,
+                        {"field": "area", "op": "eq", "value": "sinchon"},
+                        {"field": "price_krw", "op": "lte", "value": 20000},
+                        {"field": "seating_type", "op": "eq", "value": "seated"}]}
 DOC_QUERY = "11월 7일 신촌에서 혼자 볼 만한 2만 원 이하 잔잔한 좌석 공연만 추천해 줘"
+NO_FILTERS = {"date": None, "area": None, "max_price_krw": None, "mood_tags": [], "solo_friendly": None,
+              "seating_preference": None, "seating_requirement": None}
 
 
 @pytest.fixture()
@@ -27,348 +27,345 @@ def eid(db):
     return _eid
 
 
-@pytest.fixture()
-def fake_llm(monkeypatch):
-    """state['responses']: 호출마다 순서대로 반환(마지막 값 반복). 예외 객체면 raise."""
-    state = {"responses": [], "calls": []}
-
-    def _fake(query, candidates, today_kst, locale):
-        state["calls"].append({"query": query, "candidates": candidates, "today": today_kst, "locale": locale})
-        responses = state["responses"]
-        value = responses.pop(0) if len(responses) > 1 else responses[0]
-        if isinstance(value, Exception):
-            raise value
-        return value
-
-    monkeypatch.setattr(intent, "call_llm_recommend", _fake)
-    return state
-
-
 def _post(client, query="", filters=None, locale="ko"):
-    return client.post("/api/recommend", json={"query": query, "filters": filters or {}, "locale": locale})
+    return client.post("/api/recommend", json={"query": query, "filters": {**NO_FILTERS, **(filters or {})},
+                                               "locale": locale})
 
 
-def _resp(filters=None, items=()):
-    return {"applied_filters": filters or {}, "items": [{"event_id": i, "reason": r} for i, r in items]}
+def _search(required=None, **kw):
+    args = dict(kw)
+    if required is not None:
+        args["required_conditions"] = json.dumps(required, ensure_ascii=False)
+    return fc("search_events", args)
 
 
-# ---------- LLM 직접 추천 ----------
-def test_llm_recommends_directly(client, fake_llm, eid):
+def _submit(items=(), status="ok", **kw):
+    return fc("submit_recommendations", {"status": status, "items": list(items), **kw})
+
+
+# ---------- AI 정상 흐름 ----------
+def test_ai_searches_then_recommends_with_verified_evidence(client, gemini, eid):
     walk = eid("밤의 산책")
-    fake_llm["responses"] = [_resp(DOC_FILTERS, [(walk, "신촌에서 예매가 15,000원인 차분한 좌석 공연이에요.")])]
+    gemini.add(
+        _search(DOC_REQUIRED),
+        _submit([{"event_id": walk, "reason": "신촌에서 예매가 15,000원인 차분한 좌석 공연이라 요청에 어울릴 수 있어요.",
+                  "evidence": [{"field": "seating_type", "value": "seated"},
+                               {"field": "mood_tags", "value": "calm"},
+                               {"field": "price_krw", "value": "15000"}]}],
+                preferences=["혼자 관람하기 좋은 공연", "잔잔한 분위기"]),
+    )
     res = _post(client, DOC_QUERY)
-    assert res.status_code == 200
+    assert res.status_code == 200, res.json()
     body = res.json()
-    assert len(fake_llm["calls"]) == 1 and fake_llm["calls"][0]["query"] == DOC_QUERY
-    assert body["applied_filters"] == {**{k: v for k, v in DOC_FILTERS.items() if k != "date_expression"},
-                                       "date": "2026-11-07"}
+    assert body["status"] == "ok" and body["clarification"] is None
     assert [i["event"]["title"] for i in body["items"]] == ["밤의 산책"]
     item = body["items"][0]
-    assert item["reason"] == "신촌에서 예매가 15,000원인 차분한 좌석 공연이에요."  # LLM 문장 사용
-    assert item["matched_tags"] == ["calm"] and "score" not in item  # 고정 점수 미노출 (API.md §6)
-    assert body["total_matches"] == 2  # 하드 조건 통과: 밤의 산책, 어쿠스틱 선데이
-    assert body["used_fallback"] is False
+    assert item["reason"].startswith("신촌에서 예매가 15,000원인") and "score" not in item
+    assert item["matched_tags"] == ["calm"]  # 근거로 검증된 태그
+    assert item["event"]["title_en"] == "Night Walk" and item["event"]["translation"]["status"] == "reviewed"
+    assert body["applied_conditions"] == DOC_REQUIRED
+    assert body["applied_filters"] == {**NO_FILTERS, "date": "2026-11-07", "area": "sinchon",
+                                       "max_price_krw": 20000, "seating_requirement": "seated"}
+    assert body["total_matches"] == 2  # 밤의 산책·어쿠스틱 선데이 (새벽 네온 mixed, 모노 포크 가격 미확인 제외)
+    assert body["preferences"] == ["혼자 관람하기 좋은 공연", "잔잔한 분위기"]
+    assert body["search_limited"] is False and body["used_fallback"] is False
     assert body["notice"] == "예매 가능 여부는 예매처에서 확인해 주세요."
-    # API.md §6 응답 필드
-    assert body["status"] == "ok" and body["clarification"] is None and body["search_limited"] is False
-    assert body["applied_conditions"] == {"all": [
-        {"field": "starts_at", "op": "gte", "value": "2026-11-07T00:00:00+09:00"},
-        {"field": "starts_at", "op": "lt", "value": "2026-11-08T00:00:00+09:00"},
-        {"field": "area", "op": "eq", "value": "sinchon"},
-        {"field": "price_krw", "op": "lte", "value": 20000},
-        {"field": "seating_type", "op": "eq", "value": "seated"},
-    ]}
-    assert body["preferences"] == ["차분한 분위기", "혼자 관람하기 좋은 공연"]
+
+    # 모델에 전달한 요청: 원문 그대로, 도구 선언, 함수 호출 강제, 조회 결과 반환
+    first = gemini.requests[0]
+    assert json.loads(first["contents"][0]["parts"][0]["text"])["query"] == DOC_QUERY
+    names = [d["name"] for d in first["tools"][0]["functionDeclarations"]]
+    assert names == ["search_events", "get_event_details", "submit_recommendations"]
+    assert first["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
+    assert gemini.urls[0].endswith("/models/gemini-3.5-flash:generateContent")
+    assert gemini.headers[0]["x-goog-api-key"] == "test-key"
+    result = function_responses(gemini.requests[1])[0]["response"]
+    assert {i["title"] for i in result["items"]} == {"밤의 산책", "어쿠스틱 선데이"}
+    assert result["total_matches"] == 2
+    assert gemini.requests[1]["contents"][1]["parts"][0]["thoughtSignature"] == "sig"  # 모델 턴 보존
 
 
-def test_llm_order_is_kept(client, fake_llm, eid):
-    a, b, c = eid("어쿠스틱 선데이"), eid("밤의 산책"), eid("새벽 네온")
-    fake_llm["responses"] = [_resp({"area": "sinchon"}, [(a, "이유 A"), (b, "이유 B"), (c, "이유 C")])]
-    titles = [i["event"]["title"] for i in _post(client, "신촌 공연").json()["items"]]
-    assert titles == ["어쿠스틱 선데이", "밤의 산책", "새벽 네온"]
+def test_ui_required_filters_always_apply(client, gemini):
+    gemini.add(_search({"all": []}), _submit())
+    body = _post(client, "아무 공연이나", {"area": "hongdae", "date": "2026-11-07"}).json()
+    rows = function_responses(gemini.requests[1])[0]["response"]["items"]
+    assert rows and all(r["area"] == "hongdae" and r["starts_at"].startswith("2026-11-07") for r in rows)
+    assert body["applied_conditions"] == {"all": [*DAY, {"field": "area", "op": "eq", "value": "hongdae"}]}
+    assert body["notice"] == "조건에 맞는 공연은 있지만 요청에 맞는 추천을 고르지 못했어요."
 
 
-def test_candidates_are_db_facts_only(client, fake_llm, eid):
-    fake_llm["responses"] = [_resp()]
-    _post(client, "아무 공연")
-    call = fake_llm["calls"][0]
-    titles = {c["title"] for c in call["candidates"]}
-    assert len(titles) == 20 and not titles & {"지난 공연", "준비 중 공연", "취소된 공연"}
-    walk = next(c for c in call["candidates"] if c["title"] == "밤의 산책")
-    assert walk["starts_at_kst"] == "2026-11-07T19:00" and walk["doors_open_at_kst"] == "2026-11-07T18:30"
-    assert walk["price_krw"] == 15000 and walk["price_basis"] == "advance" and walk["area"] == "sinchon"
-    assert call["today"] == "2026-11-06" and call["locale"] == "ko"
+def test_conflict_with_ui_filter_is_returned_to_the_model(client, gemini):
+    gemini.add(
+        _search({"all": [{"field": "area", "op": "eq", "value": "sinchon"}]}),
+        _search({"all": []}),
+        _submit(),
+    )
+    _post(client, "신촌 공연", {"area": "hongdae"})
+    error = function_responses(gemini.requests[1])[0]["response"]["error"]
+    assert "contradicts the user's explicit UI filter" in error
+    assert "items" in function_responses(gemini.requests[2])[0]["response"]
 
 
-def test_ui_filters_prefilter_candidates_and_override(client, fake_llm, eid):
-    rock = eid("홍대 록 파티")
-    fake_llm["responses"] = [_resp({"area": "hongdae", "mood_tags": ["energetic"]}, [(rock, "신나는 록 공연")])]
-    body = _post(client, "홍대 신나는 공연", {"area": "sinchon"}).json()
-    assert {c["area"] for c in fake_llm["calls"][0]["candidates"]} == {"sinchon"}
-    assert body["applied_filters"]["area"] == "sinchon"  # UI 우선
-    assert body["items"] == []  # 홍대 공연은 UI 조건 위반 → 제거
-    assert "제외" in body["notice"]
+def test_required_conditions_are_locked_after_first_search(client, gemini):
+    gemini.add(
+        _search({"all": [{"field": "area", "op": "eq", "value": "sinchon"}]}),
+        _search({"all": []}),  # 필수 조건 완화 시도
+        _search(where=json.dumps({"field": "mood_tags", "op": "contains", "value": "calm"})),
+        _submit(),
+    )
+    body = _post(client, "신촌만").json()
+    assert "fixed after the first search" in function_responses(gemini.requests[2])[0]["response"]["error"]
+    third = function_responses(gemini.requests[3])[0]["response"]
+    assert third["items"] and all(r["area"] == "sinchon" and "calm" in r["mood_tags"] for r in third["items"])
+    assert body["applied_conditions"] == {"all": [{"field": "area", "op": "eq", "value": "sinchon"}]}
 
 
-@pytest.mark.parametrize("title_or_id", [9999, "준비 중 공연", "취소된 공연", "지난 공연"])
-def test_unknown_or_unpublished_ids_removed(client, fake_llm, eid, title_or_id):
-    bad = title_or_id if isinstance(title_or_id, int) else eid(title_or_id)
-    good = eid("밤의 산책")
-    fake_llm["responses"] = [_resp({}, [(bad, "없는 공연"), (good, "좋은 공연")])]
-    body = _post(client, "공연 추천").json()
-    assert [i["event"]["id"] for i in body["items"]] == [good]
-    assert "제외" in body["notice"]
+def test_unseen_or_invalid_picks_get_one_correction_then_dropped(client, gemini, eid):
+    walk, draft = eid("밤의 산책"), eid("준비 중 공연")
+    good = {"event_id": walk, "reason": "좌석 공연이에요.", "evidence": [{"field": "seating_type", "value": "seated"}]}
+    gemini.add(
+        _search({"all": [*DAY, {"field": "area", "op": "eq", "value": "sinchon"}]}),
+        _submit([{"event_id": 99999, "reason": "없는 공연", "evidence": [{"field": "title", "value": "x"}]}, good]),
+        _submit([{"event_id": draft, "reason": "초안", "evidence": [{"field": "title", "value": "준비 중 공연"}]},
+                 good]),
+    )
+    body = _post(client, "11월 7일 신촌").json()
+    correction = function_responses(gemini.requests[2])[0]["response"]
+    assert "failed server verification" in correction["error"] and "was not returned" in correction["problems"][0]
+    assert [i["event"]["id"] for i in body["items"]] == [walk]  # 두 번째 제출에서 무효 항목은 제외
+    assert "확인되지 않는 공연은 제외" in body["notice"]
 
 
-def test_llm_pick_violating_its_own_hard_filters_removed(client, fake_llm, eid):
-    rock, jazz, free = eid("홍대 록 파티"), eid("블루 재즈 데이트"), eid("라운지 언플러그드")
-    filters = {"date_expression": "2026-11-07", "area": "hongdae", "max_price_krw": 20000,
-               "seating_requirement": "seated"}
-    fake_llm["responses"] = [_resp(filters, [(rock, "록"), (free, "무료"), (jazz, "재즈")])]
-    body = _post(client, "11월 7일 홍대 2만원 이하 좌석만").json()
-    # 록 파티: 현장 25,000 예산 초과 / 라운지: 이벤트 좌석 정보 null → 좌석 필수 불충족
-    assert [i["event"]["title"] for i in body["items"]] == ["블루 재즈 데이트"]
-    assert body["total_matches"] == 1
-
-
-def test_max_three_and_duplicates(client, fake_llm, eid):
-    ids = [eid(t) for t in ("밤의 산책", "밤의 산책", "새벽 네온", "겨울 노래", "피아노 라이브")]
-    fake_llm["responses"] = [_resp({}, [(i, "이유") for i in ids])]
-    body = _post(client, "공연").json()
-    assert [i["event"]["title"] for i in body["items"]] == ["밤의 산책", "새벽 네온", "겨울 노래"]
-
-
-def test_llm_empty_items_is_200_empty(client, fake_llm):
-    fake_llm["responses"] = [_resp({"area": "sinchon"}, [])]
-    body = _post(client, "조건에 맞는 게 없을 질의").json()
-    assert body["items"] == [] and body["notice"] == "조건에 맞는 공연이 없습니다."
-
-
-def test_no_candidates_skips_llm(client, fake_llm):
-    fake_llm["responses"] = [_resp()]
-    body = _post(client, "무료 좌석", {"date": "2026-11-07", "max_price_krw": 0, "seating_requirement": "seated"})
-    assert body.status_code == 200 and body.json()["items"] == [] and body.json()["total_matches"] == 0
-    assert fake_llm["calls"] == []
-
-
-@pytest.mark.parametrize(
-    "reason_text",
-    ["지금 예매 가능한 인기 1위 공연!", "혼자 가기 완벽하고 안전한 곳", "좌석이 반드시 남아 있어요",
-     "", None, 123, "x" * 301, "자세한 건 https://evil.example 참고"],
-)
-def test_unsafe_llm_reason_replaced_by_template(client, fake_llm, eid, reason_text):
+def test_fabricated_evidence_is_rejected(client, gemini, eid):
     walk = eid("밤의 산책")
-    fake_llm["responses"] = [{"applied_filters": DOC_FILTERS, "items": [{"event_id": walk, "reason": reason_text}]}]
-    body = _post(client, DOC_QUERY).json()
-    item = body["items"][0]
-    assert item["reason"].startswith("신촌 공연이며 예매가 15,000원으로 안내되어 있고")
+    fake = {"event_id": walk, "reason": "만 원짜리 공연", "evidence": [{"field": "price_krw", "value": "10000"}]}
+    gemini.add(_search({"all": DAY}), _submit([fake]), _submit([fake]))
+    body = _post(client, "11월 7일 싼 공연").json()
+    assert body["items"] == []
+    assert "does not match the stored data" in function_responses(gemini.requests[2])[0]["response"]["problems"][0]
+
+
+def test_unsafe_ai_reason_is_replaced_by_fact_template(client, gemini, eid):
+    walk = eid("밤의 산책")
+    gemini.add(_search({"all": [*DAY, {"field": "area", "op": "eq", "value": "sinchon"}]}),
+               _submit([{"event_id": walk, "reason": "지금 예매 가능한 인기 1위 공연!",
+                         "evidence": [{"field": "area", "value": "신촌"}]}]))
+    body = _post(client, "신촌 인기 공연").json()
+    assert body["items"][0]["reason"].startswith("신촌 공연이며 예매가 15,000원으로 안내")
     assert body["used_fallback"] is True
 
 
-def test_requirement_preference_conflict(client, fake_llm, eid):
-    fake_llm["responses"] = [_resp({"seating_requirement": "seated", "seating_preference": "standing"},
-                                   [(eid("밤의 산책"), "좌석 공연")])]
-    body = _post(client, "좌석만, 근데 스탠딩이 좋아").json()
-    assert body["applied_filters"]["seating_requirement"] == "seated"
-    assert body["applied_filters"]["seating_preference"] is None
-    assert "충돌" in body["notice"]
+def test_clarification_before_search(client, gemini):
+    gemini.add(_submit(status="needs_clarification", clarification="'2만 원 정도'는 2만 원 이하로 볼까요?"))
+    body = _post(client, "2만 원 정도인 공연").json()
+    assert body["status"] == "needs_clarification" and body["items"] == []
+    assert body["clarification"] == "'2만 원 정도'는 2만 원 이하로 볼까요?"
+    assert body["applied_conditions"] is None and body["total_matches"] is None
+    assert body["search_limited"] is False
 
 
-def test_invalid_llm_filters_dropped_with_notice(client, fake_llm):
-    fake_llm["responses"] = [_resp({"area": "gangnam", "date_expression": "this_week",
-                                    "mood_tags": ["calm", "cozy"], "max_price_krw": -5,
-                                    "seating_requirement": "vip"})]
-    body = _post(client, "이번 주 강남 공연").json()
-    f = body["applied_filters"]
-    assert f["area"] is None and f["date"] is None and f["max_price_krw"] is None
-    assert f["mood_tags"] == ["calm"] and f["seating_requirement"] is None
-    assert "신촌·홍대" in body["notice"] and "날짜" in body["notice"]
+def test_recommend_before_search_is_refused(client, gemini, eid):
+    gemini.add(_submit([{"event_id": eid("밤의 산책"), "reason": "x", "evidence": [{"field": "area", "value": "신촌"}]}]),
+               _search({"all": []}), _submit())
+    _post(client, "아무거나")
+    assert "call search_events before recommending" in function_responses(gemini.requests[1])[0]["response"]["error"]
 
 
-def test_today_resolved_in_kst(client, fake_llm, eid):
-    fake_llm["responses"] = [_resp({"date_expression": "today"}, [(eid("오늘의 무대"), "오늘 공연")])]
-    body = _post(client, "오늘 공연").json()
-    assert body["applied_filters"]["date"] == "2026-11-06"
-    assert [i["event"]["title"] for i in body["items"]] == ["오늘의 무대"]
+def test_tool_call_limit_forces_final_answer(client, gemini):
+    gemini.add(_search({"all": []}, limit=1), *[_search(limit=1) for _ in range(6)], _submit())
+    body = _post(client, "계속 찾아줘").json()
+    assert body["status"] == "ok" and body["search_limited"] is True
+    forced = gemini.requests[-1]["toolConfig"]["functionCallingConfig"]
+    assert forced == {"mode": "ANY", "allowedFunctionNames": ["submit_recommendations"]}
+    assert "tool call limit reached" in function_responses(gemini.requests[-1])[0]["response"]["error"]
+    assert "모든 후보를 살펴보기 전에" in body["notice"]
 
 
-def test_bad_item_entries_ignored(client, fake_llm, eid):
-    walk = eid("밤의 산책")
-    fake_llm["responses"] = [{"applied_filters": {}, "items": ["x", {"event_id": "1"}, {"event_id": True},
-                                                               {"event_id": walk, "reason": "좋은 공연"}]}]
-    body = _post(client, "공연").json()
-    assert [i["event"]["id"] for i in body["items"]] == [walk]
+def test_pagination_cursor_and_keywords(client, gemini):
+    def second_page(body):
+        cursor = function_responses(body)[0]["response"]["next_cursor"]
+        assert cursor
+        return _search(cursor=cursor, limit=2)
+
+    gemini.add(_search({"all": []}, limit=2), second_page,
+               _search(cursor="bogus", where=json.dumps({"field": "genre", "op": "eq", "value": "jazz"})),
+               _search(keywords=["Folk Sample"]), _submit())
+    _post(client, "공연")
+    page1 = function_responses(gemini.requests[1])[0]["response"]
+    page2 = function_responses(gemini.requests[2])[0]["response"]
+    assert page1["total"] == 20 and len(page1["items"]) == 2
+    assert {i["id"] for i in page1["items"]}.isdisjoint({i["id"] for i in page2["items"]})
+    both = [i["starts_at"] for i in page1["items"] + page2["items"]]
+    assert both == sorted(both)
+    assert "cursor does not belong" in function_responses(gemini.requests[3])[0]["response"]["error"]
+    found = function_responses(gemini.requests[4])[0]["response"]["items"]
+    assert [i["title"] for i in found] == ["모노 포크 나잇"]  # 출연진 키워드
 
 
-# ---------- LLM 장애/형식 오류 ----------
-def test_malformed_response_retried_once(client, fake_llm, eid):
-    fake_llm["responses"] = ["not-json", _resp({}, [(eid("밤의 산책"), "좋은 공연")])]
-    res = _post(client, "공연")
-    assert res.status_code == 200 and len(res.json()["items"]) == 1
-    assert len(fake_llm["calls"]) == 2
+def test_search_never_returns_past_draft_or_cancelled(client, gemini):
+    gemini.add(_search({"all": []}, limit=50), _submit())
+    _post(client, "전부")
+    titles = {i["title"] for i in function_responses(gemini.requests[1])[0]["response"]["items"]}
+    assert len(titles) == 20 and not titles & {"지난 공연", "준비 중 공연", "취소된 공연"}
 
 
-def test_malformed_twice_without_filters_is_503(client, fake_llm):
-    fake_llm["responses"] = [{"items": "nope"}]
-    res = _post(client, "공연")
-    assert res.status_code == 503 and len(fake_llm["calls"]) == 2  # 무한 재시도 금지
+def test_event_details_only_for_seen_ids(client, gemini, eid):
+    walk, rock = eid("밤의 산책"), eid("홍대 록 파티")
+    gemini.add(_search({"all": [*DAY, {"field": "area", "op": "eq", "value": "sinchon"}]}),
+               fc("get_event_details", {"event_ids": [walk, rock]}), _submit())
+    _post(client, "신촌")
+    events = function_responses(gemini.requests[2])[0]["response"]["events"]
+    assert events[0]["admission_notes_ko"].startswith("좌석은 비지정석") and events[0]["venue"]["floor"] == "B1"
+    assert events[1] == {"id": rock, "error": "not returned by search_events in this request"}
 
 
-def test_llm_exception_with_filters_falls_back_without_leak(client, fake_llm):
-    fake_llm["responses"] = [RuntimeError("secret-key-sk-123")]
-    res = _post(client, "신촌 공연", {"area": "sinchon"})
-    assert res.status_code == 200 and "secret" not in res.text
-    assert res.json()["used_fallback"] is True
+def test_same_bad_call_twice_stops_exploration(client, gemini):
+    bad = _search({"field": "nope", "op": "eq", "value": 1})
+    gemini.add(bad, bad, _submit(status="needs_clarification", clarification="어떤 공연을 원하세요?"))
+    body = _post(client, "이상한 요청").json()
+    assert gemini.requests[2]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"] == [
+        "submit_recommendations"]
+    assert body["status"] == "needs_clarification"
 
 
-# ---------- AI 미연결(현재 기본 상태) → 규칙 기반 복구 ----------
-def test_ai_blank_with_filters_falls_back(client):
-    data = _post(client, "신촌 좌석 공연", {"area": "sinchon", "seating_requirement": "seated"}).json()
-    assert data["used_fallback"] is True and "필터로만" in data["notice"]
-    assert all(i["event"]["venue"]["area"] == "sinchon" for i in data["items"])
-    assert all(i["event"]["seating_type"] == "seated" for i in data["items"])
+# ---------- AI 장애: 수동 필터가 있어도 자동 대체하지 않음 (API.md §6) ----------
+@pytest.mark.parametrize("failure", [503, 429, 500])
+def test_ai_http_failure_is_503_even_with_filters(client, gemini, failure):
+    gemini.add(failure, failure, failure)  # 일시 장애 재시도(2회) 후에도 계속 실패
+    res = _post(client, "홍대 공연", {"area": "hongdae"})
+    assert res.status_code == 503 and res.json()["error"]["code"] == "AI_UNAVAILABLE"
+    assert "test-key" not in res.text
+    assert len(gemini.requests) == 3
 
 
-def test_ai_blank_without_filters_is_503(client):
-    res = _post(client, "아무 공연이나 추천해 줘")
+def test_ai_transient_failure_is_retried_within_budget(client, gemini):
+    gemini.add(503, _search({"all": []}), 429, _submit())
+    res = _post(client, "홍대 공연", {"area": "hongdae"})
+    assert res.status_code == 200, res.json()
+    assert res.json()["status"] == "ok" and len(gemini.requests) == 4
+    # 재시도한 요청 본문은 원래 요청과 같다 (대화 이력이 중복 추가되지 않음)
+    assert gemini.requests[0] == gemini.requests[1] and gemini.requests[2] == gemini.requests[3]
+
+
+def test_ai_bad_request_is_not_retried(client, gemini):
+    gemini.add(400)
+    assert _post(client, "홍대 공연").status_code == 503 and len(gemini.requests) == 1
+
+
+def test_ai_timeout_is_503(client, gemini):
+    import httpx
+
+    gemini.add(httpx.ReadTimeout("slow"))
+    assert _post(client, "공연").status_code == 503
+
+
+def test_ai_not_configured_is_503(client):
+    res = _post(client, "아무 공연이나 추천해 줘", {"area": "sinchon"})
     assert res.status_code == 503 and res.json()["error"]["code"] == "AI_UNAVAILABLE"
 
 
-def test_filters_only_does_not_call_llm(client, fake_llm):
-    fake_llm["responses"] = [_resp()]
+def test_model_text_instead_of_function_is_nudged(client, gemini):
+    from conftest import text
+
+    gemini.add(text("hello"), _search({"all": []}), _submit())
+    assert _post(client, "공연").status_code == 200
+    assert "calling one of the functions" in gemini.requests[1]["contents"][-1]["parts"][0]["text"]
+
+
+# ---------- 필터만 (AI 없음) ----------
+def test_filters_only_does_not_call_ai(client, gemini):
     data = _post(client, "   ", {"area": "hongdae"}).json()
-    assert fake_llm["calls"] == [] and len(data["items"]) == 3
-    # 검색어 없이 필터만: used_fallback=true + AI 순위 미적용 안내, 표시보다 후보가 많으면 search_limited
+    assert gemini.requests == [] and len(data["items"]) == 3
     assert data["used_fallback"] is True and "AI 추천 순위는 적용되지 않았어요" in data["notice"]
     assert data["search_limited"] is True and data["total_matches"] > 3
     assert data["applied_conditions"] == {"all": [{"field": "area", "op": "eq", "value": "hongdae"}]}
-    assert data["preferences"] == [] and data["status"] == "ok"
+    assert data["status"] == "ok" and all("score" not in i for i in data["items"])
 
 
-# ---------- 규칙 기반 경로 (필터만 / AI 장애) ----------
-def test_rule_doc_example_score(client):
+def test_filters_only_doc_example(client):
     body = _post(client, filters={"date": "2026-11-07", "area": "sinchon", "max_price_krw": 20000,
                                   "mood_tags": ["calm"], "solo_friendly": True,
                                   "seating_requirement": "seated"}).json()
-    assert body["total_matches"] == 2
-    first = body["items"][0]
-    assert first["event"]["title"] == "밤의 산책" and first["matched_tags"] == ["calm"]
-    assert all("score" not in i for i in body["items"])
-    assert body["search_limited"] is False  # 후보 2개 모두 표시
-    assert first["reason"].startswith("신촌 공연이며 예매가 15,000원으로 안내되어 있고")
+    assert body["total_matches"] == 2 and body["items"][0]["event"]["title"] == "밤의 산책"
+    assert body["items"][0]["reason"].startswith("신촌 공연이며 예매가 15,000원으로 안내되어 있고")
+    assert body["preferences"] == ["차분한 분위기", "혼자 관람하기 좋은 공연"]
 
 
-def test_rule_seating_preference_is_soft(client):
-    body = _post(client, filters={"date": "2026-11-07", "area": "hongdae", "max_price_krw": 20000,
-                                  "seating_preference": "seated"}).json()
-    # 좌석 선호는 순서만 바꾼다(좌석 공연이 먼저), 스탠딩·미확인 공연도 남는다
-    assert [i["event"]["title"] for i in body["items"]] == ["블루 재즈 데이트", "라운지 언플러그드", "인디 쇼케이스"]
-    assert body["preferences"] == ["좌석 관람 선호"]
+def test_filters_only_seating_requirement_and_budget(client):
+    seated = _post(client, filters={"seating_requirement": "seated"}).json()
+    assert {i["event"]["seating_type"] for i in seated["items"]} == {"seated"} and seated["total_matches"] == 10
+    free = _post(client, filters={"max_price_krw": 0}).json()
+    assert {i["event"]["title"] for i in free["items"]} == {"라운지 언플러그드", "신인 밴드 경연"}
+    conflict = _post(client, filters={"seating_requirement": "seated", "seating_preference": "standing"}).json()
+    assert conflict["applied_filters"]["seating_preference"] is None and "충돌" in conflict["notice"]
 
 
-def test_rule_seating_requirement_excludes_null_mixed_standing(client):
-    body = _post(client, filters={"seating_requirement": "seated"}).json()
-    assert {i["event"]["seating_type"] for i in body["items"]} == {"seated"}
-    assert body["total_matches"] == 10
-
-
-def test_rule_budget_unknown_excluded_zero_free(client):
-    body = _post(client, filters={"max_price_krw": 0}).json()
-    assert {i["event"]["title"] for i in body["items"]} == {"라운지 언플러그드", "신인 밴드 경연"}
-    assert "무료로 안내" in body["items"][0]["reason"]
-    body = _post(client, filters={"date": "2026-11-07", "max_price_krw": 100000}).json()
-    assert body["total_matches"] == 7
-
-
-def test_rule_advance_price_counts_for_budget(client):
-    body = _post(client, filters={"date": "2026-11-07", "area": "sinchon", "max_price_krw": 20000,
-                                  "mood_tags": ["energetic"]}).json()
-    first = body["items"][0]
-    assert first["event"]["title"] == "새벽 네온" and first["event"]["price_basis"] == "advance"
-    assert "예매가 20,000원" in first["reason"]
-
-
-def test_rule_max_three_and_tiebreak(client):
-    body = _post(client, filters={"mood_tags": ["calm", "acoustic"]}).json()
-    assert len(body["items"]) == 3 and body["total_matches"] == 20
-    # 두 태그가 모두 맞는 공연이 먼저, 동점이면 시작 시각 순
-    assert body["items"][0]["matched_tags"] == ["calm", "acoustic"]
-    tags = [len(i["matched_tags"]) for i in body["items"]]
-    assert tags == sorted(tags, reverse=True)
-
-
-def test_rule_past_draft_cancelled_never_recommended(client):
-    body = _post(client, filters={"mood_tags": ["calm"], "max_price_krw": 10000}).json()
-    assert not {i["event"]["title"] for i in body["items"]} & {"지난 공연", "준비 중 공연", "취소된 공연"}
-
-
-def test_rule_reason_english(client):
-    filters = {"date": "2026-11-07", "area": "sinchon", "mood_tags": ["calm"], "seating_requirement": "seated"}
-    data = _post(client, filters=filters, locale="en").json()
+def test_filters_only_english(client):
+    data = _post(client, filters={"date": "2026-11-07", "area": "sinchon", "max_price_krw": 20000,
+                                  "mood_tags": ["calm"], "seating_requirement": "seated"}, locale="en").json()
     assert data["items"][0]["reason"] == (
-        "A Sinchon show whose price is not confirmed, with confirmed calm mood, seated viewing."
-    )
-    data = _post(client, filters={**filters, "max_price_krw": 20000}, locale="en").json()
-    assert data["items"][0]["reason"] == (
-        "A Sinchon show listed at ₩15,000 (advance), with confirmed calm mood, seated viewing."
-    )
-    assert data["notice"] == ("Results for the selected filters only; AI recommendation ranking was not applied. "
-                              "Please check ticket availability with the seller.")
+        "A Sinchon show listed at ₩15,000 (advance), with confirmed calm mood, seated viewing.")
     assert data["preferences"] == ["Calm mood"]
-
-
-FORBIDDEN = ["예매 가능", "인기", "완벽", "안전", "반드시", "남아"]
-
-
-def test_rule_reason_never_uses_forbidden_claims(client):
-    for filters in ({"area": "sinchon", "solo_friendly": True, "mood_tags": ["calm"]},
-                    {"area": "hongdae", "seating_preference": "standing"},
-                    {"max_price_krw": 0}):
-        for item in _post(client, filters=filters).json()["items"]:
-            assert not any(w in item["reason"] for w in FORBIDDEN), item["reason"]
 
 
 # ---------- 입력 검증 ----------
 @pytest.mark.parametrize(
-    "payload, status, code",
+    "payload",
     [
-        ({"query": "", "filters": {}}, 422, "VALIDATION_ERROR"),  # API.md §6: 둘 다 없으면 422
-        ({"query": "   "}, 422, "VALIDATION_ERROR"),
-        ({"query": "x" * 501}, 422, "VALIDATION_ERROR"),
-        ({"filters": {"mood_tags": ["cozy"]}}, 422, "VALIDATION_ERROR"),
-        ({"filters": {"area": "gangnam"}}, 422, "VALIDATION_ERROR"),
-        ({"filters": {"max_price_krw": -1}}, 422, "VALIDATION_ERROR"),
-        ({"filters": {"date": "2026-13-40"}}, 422, "VALIDATION_ERROR"),
-        ({"filters": {"seating_requirement": "mixed"}}, 422, "VALIDATION_ERROR"),
-        ({"filters": {"area": "sinchon"}, "locale": "jp"}, 422, "VALIDATION_ERROR"),
-        ({"filters": {"area": "sinchon"}, "price_basis": "x"}, 422, "VALIDATION_ERROR"),
+        {"query": "", "filters": {}},
+        {"query": "   "},
+        {"query": "x" * 501},
+        {"filters": {"mood_tags": ["cozy"]}},
+        {"filters": {"area": "gangnam"}},
+        {"filters": {"max_price_krw": -1}},
+        {"filters": {"date": "2026-13-40"}},
+        {"filters": {"seating_requirement": "mixed"}},
+        {"filters": {"area": "sinchon"}, "locale": "jp"},
+        {"filters": {"area": "sinchon"}, "price_basis": "x"},
     ],
 )
-def test_validation(client, payload, status, code):
+def test_validation(client, payload):
     res = client.post("/api/recommend", json=payload)
-    assert res.status_code == status, res.json()
-    assert res.json()["error"]["code"] == code
-
-
-def test_malformed_json_common_error(client):
-    res = client.post("/api/recommend", content=b"{bad json", headers={"Content-Type": "application/json"})
     assert res.status_code == 422 and res.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
-# ---------- 단위 ----------
-def test_unit_parse_intent_payload():
-    from services.intent import parse_intent_payload
+# ---------- EventQuery 조건식 ----------
+@pytest.mark.parametrize(
+    "node, message",
+    [
+        ({"field": "nope", "op": "eq", "value": 1}, "unknown field"),
+        ({"field": "area", "op": "like", "value": "x"}, "unknown op"),
+        ({"field": "area", "op": "eq", "value": "gangnam"}, "must be one of"),
+        ({"field": "price_krw", "op": "lte", "value": True}, "integer"),
+        ({"field": "price_krw", "op": "lte", "value": -1}, "integer"),
+        ({"field": "starts_at", "op": "gte", "value": "2026-11-07T00:00:00"}, "timezone"),
+        ({"field": "starts_at", "op": "eq", "value": "2026-11-07T00:00:00+09:00"}, "ranges only"),
+        ({"field": "title", "op": "gte", "value": "a"}, "only for numbers"),
+        ({"field": "lineup", "op": "eq", "value": "a"}, "is a list"),
+        ({"field": "solo_friendly", "op": "in", "value": [True]}, "eq or is_null"),
+        ({"field": "genre", "op": "is_null", "value": "yes"}, "true or false"),
+        ({"any": []}, 'empty "any"'),
+        ({"all": [], "any": [{}]}, "exactly one key"),
+        ({"all": [{"all": [{"all": [{"all": [{"field": "area", "op": "eq", "value": "sinchon"}]}]}]}]},
+         "nested too deeply"),
+        ({"all": [{"field": "area", "op": "eq", "value": "sinchon"}] * 31}, "too many nodes"),
+        ({"field": "title", "op": "in", "value": []}, "list of 1-50"),
+    ],
+)
+def test_event_query_rejects(node, message):
+    from services.intent import QueryError, compile_query
 
-    r = parse_intent_payload({"max_price_krw": True, "solo_friendly": "yes", "mood_tags": "calm"})
-    assert r.intent.max_price_krw is None and r.intent.solo_friendly is None
-    assert set(r.dropped) == {"max_price_krw", "solo_friendly", "mood_tags"}
-    with pytest.raises(ValueError):
-        parse_intent_payload(["x"])
+    with pytest.raises(QueryError, match=message):
+        compile_query(node)
 
 
-def test_unit_check_llm_reason():
-    from services.reason import check_llm_reason
+def test_event_query_values_are_bound_not_interpolated(client, gemini, db):
+    gemini.add(_search({"all": []}, where=json.dumps(
+        {"field": "title", "op": "contains", "value": "'; DROP TABLE events; --"})), _submit())
+    _post(client, "x")
+    assert function_responses(gemini.requests[1])[0]["response"]["total"] == 0
+    assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 23
+    from services.intent import compile_query
 
-    assert check_llm_reason("  차분한   좌석 공연이에요. ") == "차분한 좌석 공연이에요."
-    assert check_llm_reason("Tickets still available!") is None
-    assert check_llm_reason("A perfect night") is None
+    sql, params = compile_query({"field": "title", "op": "contains", "value": "50%_off"})
+    assert params == ["%50\\%\\_off%"] and "ESCAPE" in sql  # LIKE 와일드카드는 리터럴

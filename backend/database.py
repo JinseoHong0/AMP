@@ -63,6 +63,10 @@ class Settings:
     llm_provider: str
     llm_model: str
     llm_api_key: str
+    llm_thinking_level: str
+    llm_recommend_timeout_s: float
+    llm_translate_timeout_s: float
+    llm_poster_timeout_s: float
     fixed_now_utc: str | None
 
 
@@ -81,6 +85,12 @@ def get_settings() -> Settings:
         llm_provider=os.getenv("LLM_PROVIDER", ""),
         llm_model=os.getenv("LLM_MODEL", ""),
         llm_api_key=os.getenv("LLM_API_KEY", ""),
+        # Gemini 3 계열(gemini-3.5-flash 등)은 thinkingLevel 'minimal' 미지원 → 'low' 기본 (빈 값이면 모델 기본값)
+        llm_thinking_level=os.getenv("LLM_THINKING_LEVEL", "low"),
+        # 문서 한도: 추천 AI 처리 30초(AI.md §4), 등록 번역 15초(AI.md §7.1)
+        llm_recommend_timeout_s=float(os.getenv("LLM_RECOMMEND_TIMEOUT_S", "30") or 30),
+        llm_translate_timeout_s=float(os.getenv("LLM_TRANSLATE_TIMEOUT_S", "15") or 15),
+        llm_poster_timeout_s=float(os.getenv("LLM_POSTER_TIMEOUT_S", "40") or 40),
         fixed_now_utc=os.getenv("FIXED_NOW_UTC") or None,
     )
 
@@ -113,6 +123,7 @@ CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     venue_id INTEGER NOT NULL REFERENCES venues(id),
     title TEXT NOT NULL,
+    title_en TEXT,
     starts_at_utc TEXT NOT NULL,
     ends_at_utc TEXT,
     doors_open_at_utc TEXT,
@@ -128,6 +139,10 @@ CREATE TABLE IF NOT EXISTS events (
     seating_type TEXT CHECK (seating_type IS NULL OR seating_type IN ('standing','seated','mixed')),
     seat_assignment TEXT CHECK (seat_assignment IS NULL OR seat_assignment IN ('assigned','unassigned')),
     drink_policy TEXT,
+    drink_policy_en TEXT,
+    translation_status TEXT NOT NULL DEFAULT 'not_requested' CHECK (translation_status IN ('not_requested','generated','failed','reviewed')),
+    translation_source_hash TEXT,
+    translated_at_utc TEXT,
     description_ko TEXT,
     description_en TEXT,
     admission_notes_ko TEXT,
@@ -160,10 +175,33 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+# v1.1 등록 번역 개정 컬럼. `CREATE TABLE IF NOT EXISTS` 는 기존 DB 에 컬럼을 추가하지 않으므로 직접 추가한다.
+_EVENT_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("title_en", "title_en TEXT"),
+    ("drink_policy_en", "drink_policy_en TEXT"),
+    ("translation_status", "translation_status TEXT NOT NULL DEFAULT 'not_requested' "
+                           "CHECK (translation_status IN ('not_requested','generated','failed','reviewed'))"),
+    ("translation_source_hash", "translation_source_hash TEXT"),
+    ("translated_at_utc", "translated_at_utc TEXT"),
+)
+
+
+def migrate(conn: sqlite3.Connection) -> list[str]:
+    """기존 events 테이블에 없는 컬럼을 추가한다(멱등). 추가한 컬럼명을 반환."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    added = []
+    for column, ddl in _EVENT_MIGRATIONS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {ddl}")
+            added.append(column)
+    return added
+
+
 def init_db(db_path: Path | None = None) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA_SQL)
+        migrate(conn)
         conn.commit()
     finally:
         conn.close()

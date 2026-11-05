@@ -1,9 +1,9 @@
-"""POST /api/recommend — 상황 맞춤 추천.
+"""POST /api/recommend — 상황 맞춤 추천 (API.md §6).
 
-- 자연어 query 가 있으면: LLM 이 후보 중에서 **바로 추천** → 서버가 ID·하드 조건·이유 문장을 검증.
-- AI 장애/미연결: 수동 필터가 있으면 규칙 기반(하드 필터 → 소프트 랭킹 → 템플릿 이유)으로 복구,
-  필터도 없으면 503 AI_UNAVAILABLE.
-- query 없이 필터만: 규칙 기반 (AI 불필요).
+- 자연어 query 가 있으면: AI(Gemini)가 DB 조회 도구로 탐색·재조회하고 최대 3개를 고른다. 서버는 조건 유지와
+  ID·근거·필수 조건 검증을 맡는다 (services/intent.py `run_ai_search`).
+  AI 실패·시간 초과로 결과를 완성하지 못하면 503 AI_UNAVAILABLE — 수동 필터 결과로 자동 대체하지 않는다.
+- query 없이 필터만: AI 없이 필수 조건 결과(최대 3개)와 사실 템플릿 이유, used_fallback=true.
 """
 from __future__ import annotations
 
@@ -32,15 +32,17 @@ NOTICES = {
     "ko": {
         "booking": "예매 가능 여부는 예매처에서 확인해 주세요.",
         "empty": "조건에 맞는 공연이 없습니다.",
-        "ai_fallback": "AI 추천을 사용할 수 없어 선택한 필터로만 검색했어요.",
-        "removed": "AI 추천 중 조건에 맞지 않거나 확인되지 않는 공연은 제외했어요.",
+        "not_picked": "조건에 맞는 공연은 있지만 요청에 맞는 추천을 고르지 못했어요.",
+        "removed": "AI 추천 중 확인되지 않는 공연은 제외했어요.",
+        "limited": "모든 후보를 살펴보기 전에 탐색을 마쳤어요.",
         "filters_only": "검색어 없이 선택한 조건으로 찾은 결과예요. AI 추천 순위는 적용되지 않았어요.",
     },
     "en": {
         "booking": "Please check ticket availability with the seller.",
         "empty": "No shows match your conditions.",
-        "ai_fallback": "AI recommendations are unavailable, so only the selected filters were used.",
-        "removed": "Some AI picks were removed because they did not match the conditions.",
+        "not_picked": "Some shows match the requirements, but none was picked for this request.",
+        "removed": "Some AI picks were removed because they could not be verified.",
+        "limited": "The search ended before every candidate was reviewed.",
         "filters_only": "Results for the selected filters only; AI recommendation ranking was not applied.",
     },
 }
@@ -61,34 +63,27 @@ def _hard_filtered(conn: sqlite3.Connection, cond: intent_service.MergedConditio
     )
 
 
-def _response(cond, rows, items, notices, used_fallback, lang, search_limited=False) -> dict:
-    """API.md §6 응답. 점수(score)는 노출하지 않는다. 확인 질문(needs_clarification)은 AI 연결 후 사용."""
-    notices.append(NOTICES[lang]["booking"] if items else NOTICES[lang]["empty"])
+def _filters_only(conn: sqlite3.Connection, cond: intent_service.MergedConditions, lang: str) -> dict:
+    rows = _hard_filtered(conn, cond)
+    applied = cond.applied_filters()
+    items = [
+        {"event": event_summary(s.row), "matched_tags": s.matched_tags,
+         "reason": reason.build_reason(s.row, applied, s.matched_tags, lang)}
+        for s in ranker.rank(rows, cond.mood_tags, cond.solo_friendly, cond.seating_preference)
+    ]
+    notices = [*cond.notices, NOTICES[lang]["filters_only"], NOTICES[lang]["booking" if items else "empty"]]
     return {
         "status": "ok",
-        "applied_filters": cond.applied_filters(),
+        "applied_filters": applied,
         "applied_conditions": cond.applied_conditions(),
         "preferences": cond.preferences(lang),
         "total_matches": len(rows),
         "items": items,
         "notice": " ".join(notices),
-        "used_fallback": used_fallback,
-        "search_limited": search_limited,
+        "used_fallback": True,
+        "search_limited": len(rows) > len(items),  # 표시한 개수보다 후보가 많으면 (API.md §6)
         "clarification": None,
     }
-
-
-def _rule_based(conn, ui, lang, notices, used_fallback) -> dict:
-    cond = intent_service.merge_conditions(None, ui, locale=lang, today=today_kst())
-    notices.extend(cond.notices)
-    applied = cond.applied_filters()
-    rows = _hard_filtered(conn, cond)
-    items = []
-    for s in ranker.rank(rows, cond.mood_tags, cond.solo_friendly, cond.seating_preference):
-        items.append({"event": event_summary(s.row), "matched_tags": s.matched_tags,
-                      "reason": reason.build_reason(s.row, applied, s.matched_tags, lang)})
-    # 표시한 개수보다 필수 조건 후보가 많으면 탐색 범위 제한으로 알린다 (API.md §6)
-    return _response(cond, rows, items, notices, used_fallback, lang, search_limited=len(rows) > len(items))
 
 
 @router.post("/recommend", response_model=RecommendResponse)
@@ -96,9 +91,7 @@ def recommend(req: RecommendRequest, conn: sqlite3.Connection = Depends(get_db))
     lang = req.locale
     ui = req.filters.model_dump()
     query = req.query.strip()
-    has_ui = intent_service.has_effective_filter(ui)
-
-    if not query and not has_ui:
+    if not query and not intent_service.has_effective_filter(ui):
         raise ApiError(422, "VALIDATION_ERROR", "검색어 또는 필터를 1개 이상 입력해 주세요.", {"field": "query"})
     if ui["date"]:
         try:
@@ -106,46 +99,40 @@ def recommend(req: RecommendRequest, conn: sqlite3.Connection = Depends(get_db))
         except ValueError:
             raise ApiError(422, "VALIDATION_ERROR", "요청 값을 확인해 주세요.", {"field": "filters.date"})
 
+    cond = intent_service.merge_conditions(ui, locale=lang)
     if not query:
-        # 검색어 없이 필터만: AI 없이 필수 조건 결과를 반환하고, AI 순위 미적용을 알린다 (API.md §6)
-        return _rule_based(conn, ui, lang, [NOTICES[lang]["filters_only"]], used_fallback=True)
+        return _filters_only(conn, cond, lang)
 
-    # 1) 후보: 공개·미래 공연 + UI 하드 조건 선적용
-    ui_cond = intent_service.merge_conditions(None, ui, locale=lang, today=today_kst())
-    candidates = _hard_filtered(conn, ui_cond)
-    if not candidates:
-        notices = list(ui_cond.notices)
-        return _response(ui_cond, [], [], notices, False, lang)
-
-    # 2) LLM 직접 추천
     try:
-        llm = intent_service.ask_llm(
-            query, intent_service.build_candidates(candidates), today_kst().isoformat(), lang
-        )
+        outcome = intent_service.run_ai_search(conn, query, cond, lang, to_utc_str(now_utc()), today_kst())
     except AIUnavailableError:
-        if not has_ui:
-            raise ApiError(503, "AI_UNAVAILABLE", "AI 추천을 사용할 수 없습니다. 필터를 선택해 검색해 주세요.")
-        return _rule_based(conn, ui, lang, [NOTICES[lang]["ai_fallback"]], used_fallback=True)
+        raise ApiError(503, "AI_UNAVAILABLE",
+                       "AI 추천을 완료하지 못했습니다. 잠시 후 다시 시도하거나 공연 목록에서 직접 찾아보세요.")
 
-    # 3) 조건 병합(UI 우선) → DB 하드 조건 재확인
-    cond = intent_service.merge_conditions(llm.intent, ui, locale=lang, today=today_kst())
+    items = [{"event": event_summary(p.row), "matched_tags": p.matched_tags, "reason": p.reason}
+             for p in outcome.picks]
     notices = list(cond.notices)
-    applied = cond.applied_filters()
-    rows = _hard_filtered(conn, cond)
-    by_id = {r["id"]: r for r in rows}
-    picks, removed = intent_service.verify_picks(llm.picks, set(by_id))
-    if removed:
+    if "removed" in outcome.notices:
         notices.append(NOTICES[lang]["removed"])
-
-    # 4) 이유 문장 검사 (실패 시 템플릿). matched_tags 는 DB 태그와 요청 태그의 교집합으로 서버가 구성
-    used_fallback = False
-    items = []
-    for pick in picks:
-        row = by_id[pick.event_id]
-        scored = ranker.score_event(row, cond.mood_tags, cond.solo_friendly, cond.seating_preference)
-        text = reason.check_llm_reason(pick.reason)
-        if text is None:
-            text = reason.build_reason(row, applied, scored.matched_tags, lang)
-            used_fallback = True
-        items.append({"event": event_summary(row), "matched_tags": scored.matched_tags, "reason": text})
-    return _response(cond, rows, items, notices, used_fallback, lang)
+    if outcome.search_limited:
+        notices.append(NOTICES[lang]["limited"])
+    if outcome.status == "ok":
+        if items:
+            notices.append(NOTICES[lang]["booking"])
+        elif outcome.total_matches == 0:
+            notices.append(NOTICES[lang]["empty"])
+        else:
+            notices.append(NOTICES[lang]["not_picked"])
+    return {
+        "status": outcome.status,
+        "applied_filters": intent_service.summarize_filters(cond, outcome.required),
+        "applied_conditions": (intent_service.applied_conditions(cond, outcome.required)
+                               if outcome.searched else None),
+        "preferences": outcome.preferences,
+        "total_matches": outcome.total_matches,
+        "items": items if outcome.status == "ok" else [],
+        "notice": " ".join(notices) or None,
+        "used_fallback": any(p.used_fallback for p in outcome.picks),
+        "search_limited": outcome.search_limited,
+        "clarification": outcome.clarification,
+    }

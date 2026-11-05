@@ -505,15 +505,18 @@ describe.skipIf(!process.env.AMP_LIVE_API)('live backend', () => {
     expect(result.search_limited).toBe(result.total_matches! > result.items.length);
     expect(result.used_fallback).toBe(true); // AI 순위 미적용 (검색어 없음)
 
-    // AI 연결이 공란이므로 검색어만 보내면 503 AI_UNAVAILABLE
-    await expect(
-      ampApi.recommend({
-        query: '잔잔한 공연',
-        filters: { ...result.applied_filters, area: null, max_price_krw: null, mood_tags: [] },
-        locale: 'ko',
-      }),
-    ).rejects.toMatchObject({ code: 'AI_UNAVAILABLE', status: 503 });
-  });
+    // 검색어가 있으면 AI(Gemini) 경로: 성공하면 AI 순서·검증된 카드, 공급자 장애면 503 (필터 결과로 대체 금지)
+    const filters = { ...result.applied_filters, area: null, max_price_krw: null, mood_tags: [] };
+    try {
+      const ai = await ampApi.recommend({ query: '잔잔한 공연', filters, locale: 'ko' });
+      expect(['ok', 'needs_clarification']).toContain(ai.status);
+      expect(ai.items.length).toBeLessThanOrEqual(3);
+      for (const item of ai.items) expect(item).not.toHaveProperty('score');
+      if (ai.status === 'needs_clarification') expect(ai.clarification).toBeTruthy();
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'AI_UNAVAILABLE', status: 503 });
+    }
+  }, 40_000);
 
   it('createEvent registers a show that is then readable and listed (writes to the local DB)', async () => {
     const venues = await ampApi.listVenues('클럽에반스');
@@ -542,12 +545,18 @@ describe.skipIf(!process.env.AMP_LIVE_API)('live backend', () => {
       data_origin: 'demo',
       review_confirmed: true,
     });
-    expect(created).toMatchObject({
-      status: 'published',
-      poster_url: null,
-      translation: { status: 'not_requested', generated_at: null },
-    });
+    expect(created).toMatchObject({ status: 'published', poster_url: null });
+    // 영문은 저장 전에 서버가 자동 생성. 번역만 실패해도 201 등록 성공 + failed (재시도 가능)
+    expect(['generated', 'failed']).toContain(created.translation.status);
     const detail = await ampApi.getEvent(created.id, 'ko');
+    expect(detail.translation).toEqual(created.translation);
+    if (created.translation.status === 'generated') {
+      expect(detail.title_en).toBeTruthy();
+      expect(detail.description_en).toBeTruthy();
+      expect(detail.admission_notes_en).toBeNull(); // 원문 null → 영문 null
+    } else {
+      expect(detail.title_en).toBeNull();
+    }
     expect(detail).toMatchObject({
       title,
       starts_at: '2026-12-24T11:00:00Z',
@@ -567,5 +576,5 @@ describe.skipIf(!process.env.AMP_LIVE_API)('live backend', () => {
     await expect(
       ampApi.createEvent({ ...(detail as unknown as object), review_confirmed: true } as never),
     ).rejects.toMatchObject({ status: 422 }); // 서버 전용 필드(price_basis 등) 포함 → 거절
-  });
+  }, 40_000);
 });

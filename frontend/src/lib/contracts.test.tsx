@@ -112,6 +112,20 @@ describe('original-only registration', () => {
       ]),
     );
   });
+  it('rejects a start time that has already passed (browse lists upcoming shows only)', () => {
+    const form = {
+      ...emptyRegistration(),
+      title: '원문',
+      venue_id: '1',
+      review_confirmed: true,
+      starts_at_local: '2026-11-01T07:37',
+    };
+    const now = Date.parse('2026-11-06T12:00:00+09:00');
+    expect(validateRegistration(form, t, now).starts_at_local).toBeDefined();
+    expect(validateRegistration({ ...form, starts_at_local: '2026-11-07T19:00' }, t, now)).toEqual(
+      {},
+    );
+  });
   it('computes the representative ticket price and excludes all server-owned fields', () => {
     const form = { ...fromExtraction(extraction), price_krw: '99999', review_confirmed: true };
     const payload = registrationPayload(form, extraction.upload_id);
@@ -137,16 +151,25 @@ describe('original-only registration', () => {
   });
 });
 
-describe('frontend-only API boundary', () => {
-  // Connected adapters are covered in src/api/client.test.ts. Poster extraction (AI) and translation retry (AI)
-  // are intentionally still unconnected and must not pretend to succeed or send requests.
-  it('does not fabricate extraction or translation results before integration', async () => {
-    const fetch = vi.fn();
-    vi.stubGlobal('fetch', fetch);
+describe('API boundary', () => {
+  // Every adapter is connected now (see src/api/client.test.ts). None may fabricate a result:
+  // a failed server call must surface as an ApiError, never as a saved event or extraction.
+  it('surfaces server failures instead of fabricating extraction or translation results', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json(
+          { error: { code: 'AI_UNAVAILABLE', message: 'x', details: {} } },
+          { status: 503 },
+        ),
+      ),
+    );
     await expect(
       ampApi.parsePoster(new File(['x'], 'p.png', { type: 'image/png' })),
-    ).rejects.toMatchObject({ code: 'NOT_CONNECTED' });
-    await expect(ampApi.retryTranslation(1)).rejects.toMatchObject({ code: 'NOT_CONNECTED' });
-    expect(fetch).not.toHaveBeenCalled();
+    ).rejects.toMatchObject({ code: 'AI_UNAVAILABLE', status: 503 });
+    await expect(ampApi.retryTranslation(1)).rejects.toMatchObject({
+      code: 'AI_UNAVAILABLE',
+      status: 503,
+    });
   });
 });

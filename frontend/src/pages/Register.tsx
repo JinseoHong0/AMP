@@ -140,7 +140,7 @@ export default function Register() {
       setSaved(result);
       setStep('done');
       setExtraction(null);
-      // BACKEND_TODO: HTTP 201 means saved even if translation.status === 'failed'. Do not submit twice.
+      // HTTP 201 means saved even if translation.status === 'failed'. Do not submit twice.
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (error) {
       if (alive.current) setPostError(error);

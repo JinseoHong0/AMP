@@ -5,6 +5,7 @@ DB row → API dict 변환, 공개 공연 하드 필터 쿼리.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -185,11 +186,55 @@ def venue_detail(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# 등록 번역 (DATABASE.md §8 "등록 번역의 저장 계약")
+# ---------------------------------------------------------------------------
+TRANSLATION_SOURCE_FIELDS = ("title", "description_ko", "admission_notes_ko", "drink_policy")
+TRANSLATION_TARGETS = {
+    "title": "title_en",
+    "description_ko": "description_en",
+    "admission_notes_ko": "admission_notes_en",
+    "drink_policy": "drink_policy_en",
+}
+VALID_TRANSLATION_STATUSES = ("generated", "reviewed")
+
+
+def translation_source_hash(values: Any) -> str:
+    """번역 대상 4개 원문의 SHA-256 지문: 키 이름순·UTF-8·공백 없는 JSON·null 포함."""
+    payload = {key: values[key] for key in sorted(TRANSLATION_SOURCE_FIELDS)}
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def translation_is_current(row: Any) -> bool:
+    """generated|reviewed 이고 원문 지문이 현재 원문과 같을 때만 영문을 노출한다(오래된 번역 차단)."""
+    return (
+        row["translation_status"] in VALID_TRANSLATION_STATUSES
+        and row["translated_at_utc"] is not None
+        and row["translation_source_hash"] == translation_source_hash(row)
+    )
+
+
+def translation_info(row: Any) -> dict[str, Any]:
+    """API `translation` 객체. 원문 지문은 노출하지 않는다. 오래된 번역은 not_requested 로 보인다."""
+    if translation_is_current(row):
+        return {"status": row["translation_status"], "generated_at": row["translated_at_utc"]}
+    if row["translation_status"] == "failed":
+        return {"status": "failed", "generated_at": None}
+    return {"status": "not_requested", "generated_at": None}
+
+
+def _english(row: Any, column: str) -> str | None:
+    return row[column] if translation_is_current(row) else None
+
+
 def event_summary(row: sqlite3.Row) -> dict[str, Any]:
     """목록/추천 카드용. row 는 events.* + venue_id/venue_name/venue_area 를 포함해야 한다."""
     return {
         "id": row["id"],
         "title": row["title"],
+        "title_en": _english(row, "title_en"),
+        "translation": translation_info(row),
         "starts_at": row["starts_at_utc"],
         "price_krw": row["price_krw"],
         "price_basis": row["price_basis"],
@@ -209,6 +254,8 @@ def event_detail(row: sqlite3.Row) -> dict[str, Any]:
         "id": row["id"],
         "venue_id": row["venue_id"],
         "title": row["title"],
+        "title_en": _english(row, "title_en"),
+        "translation": translation_info(row),
         "starts_at": row["starts_at_utc"],
         "ends_at": row["ends_at_utc"],
         "doors_open_at": row["doors_open_at_utc"],
@@ -224,10 +271,11 @@ def event_detail(row: sqlite3.Row) -> dict[str, Any]:
         "seating_type": row["seating_type"],
         "seat_assignment": row["seat_assignment"],
         "drink_policy": row["drink_policy"],
+        "drink_policy_en": _english(row, "drink_policy_en"),
         "description_ko": row["description_ko"],
-        "description_en": row["description_en"],
+        "description_en": _english(row, "description_en"),
         "admission_notes_ko": row["admission_notes_ko"],
-        "admission_notes_en": row["admission_notes_en"],
+        "admission_notes_en": _english(row, "admission_notes_en"),
         "poster_url": media_url(row["poster_image_path"]),
         "status": row["status"],
         "data_origin": row["data_origin"],
