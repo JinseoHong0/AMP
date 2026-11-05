@@ -141,7 +141,7 @@ export function registrationPayload(
 ): CreateEventRequest {
   const nullable = (value: string) => value.trim() || null;
   const time = (value: string) => (value ? `${value}:00` : null);
-  // BACKEND_TODO: Send original fields only. The server revalidates all values and generates English.
+  // Send original fields only. The server revalidates all values and generates English.
   return {
     title: form.title.trim(),
     venue_id: Number(form.venue_id),

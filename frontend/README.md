@@ -33,15 +33,15 @@ npm run test:e2e
 | `/admin/register` | 등록           | 실제 파일 선택·미리보기·검사, 수동 입력, 추출 결과 편집, 장소 선택, 원문 확인, 성공·번역 재시도 상태            |
 | 기타              | 없는 페이지    | 안내와 홈으로 복귀                                                                                              |
 
-**백엔드·더미 데이터는 구현하지 않았습니다.** `src/api/client.ts`는 타입이 있는 연결 경계만 제공합니다. 현재 모든 API 함수는 `NOT_CONNECTED` 오류를 반환하며 네트워크 요청을 보내지 않습니다. 따라서 실제 공연 데이터·추출 결과·등록 성공은 기본 실행에서 나타나지 않습니다. 이는 미연결 상태를 정상 빈 목록이나 가짜 성공으로 숨기지 않기 위한 동작입니다.
+**프런트엔드에는 더미 데이터가 없습니다.** `src/api/client.ts`의 모든 어댑터는 FastAPI 백엔드(`VITE_API_BASE_URL`, 기본 `http://localhost:8000`)에 HTTP로 요청합니다. 백엔드가 꺼져 있거나 AI가 실패하면 오류를 그대로 `ApiError`로 표시하며, 빈 목록이나 가짜 성공으로 숨기지 않습니다.
 
-입력·필터·탭·언어 전환·파일 미리보기·폼 검증은 지금 동작합니다. 데이터가 필요한 화면은 이후 API 어댑터가 연결되면 응답을 받아 표시하도록 준비되어 있습니다. 등록 원문/이미지는 브라우저 저장소에 저장하지 않으며, 언어 설정만 저장합니다.
+추천·목록·상세·포스터 추출·등록·번역 재시도는 백엔드 응답을 그대로 표시합니다. 등록 원문/이미지는 브라우저 저장소에 저장하지 않으며, 언어 설정만 저장합니다.
 
 ## 백엔드 연결 지점
 
-`src/api/client.ts`의 각 `BACKEND_TODO`를 실제 HTTP 구현으로 교체합니다. `.env.example`의 `VITE_API_BASE_URL`은 향후 API origin이며 현재는 `/media/...` 이미지 URL 해석에도 사용됩니다. 이 값만 설정해도 HTTP 연결이 활성화되는 구조는 아닙니다.
+`src/api/client.ts`가 아래 API에 연결되어 있습니다. `.env.example`의 `VITE_API_BASE_URL`은 API origin이며 `/media/...` 이미지 URL 해석에도 사용됩니다. AI 호출 시간 한도(추천 30초·등록 번역 15초·포스터 40초)보다 길게 클라이언트 시간 제한을 둡니다.
 
-| 어댑터             | 예정 API                          | 연결 시 주의                                                    |
+| 어댑터             | API                               | 연결 시 주의                                                    |
 | ------------------ | --------------------------------- | --------------------------------------------------------------- |
 | `health`           | `GET /api/health`                 | AI 정상 여부로 해석하지 않음                                    |
 | `listEvents`       | `GET /api/events`                 | `items[]`는 공연 객체, 목록을 3개로 제한하지 않음               |
@@ -53,7 +53,7 @@ npm run test:e2e
 | `createEvent`      | `POST /api/events`                | 영문·`price_basis`는 전송 금지, 번역 실패라도 201이면 등록 성공 |
 | `retryTranslation` | `POST /api/events/{id}/translate` | 요청 본문 없음, 기존 공연 ID만 사용, 공연을 다시 등록하지 않음  |
 
-요청·응답 타입은 `src/types/api.ts`, 원문 등록 요청 구성과 검증은 `src/lib/registration.ts`, 금액·KST·번역 표현은 `src/lib/format.ts`에 있습니다. UI 입력 검증은 서버 검증을 대체하지 않습니다. 등록 API의 관리자 권한과 업로드 검사는 백엔드 연결 단계의 책임입니다. 현재 프런트는 임의로 실제 검증 데이터를 주장하지 않도록 `data_origin=demo`로 제출하게 되어 있습니다.
+요청·응답 타입은 `src/types/api.ts`, 원문 등록 요청 구성과 검증은 `src/lib/registration.ts`, 금액·KST·번역 표현은 `src/lib/format.ts`에 있습니다. UI 입력 검증은 서버 검증을 대체하지 않습니다. 등록 API의 관리자 권한과 업로드 검사는 백엔드가 담당합니다. 현재 프런트는 임의로 실제 검증 데이터를 주장하지 않도록 `data_origin=demo`로 제출하게 되어 있습니다.
 
 루트 README의 소개 필드(`price`, `advance_price`, `door_price`)는 상세 API의 wire 필드(`price_krw`, `advance_price_krw`, `door_price_krw`)로 표현했습니다. README에 남아 있는 `venue_name_detected` 표현과 API의 `extracted.venue_name`/`venue_match` 차이는 어댑터 주석에 표시했습니다. 실제 응답이 README의 별칭을 사용한다면 해당 경계에서 정규화하면 됩니다. 서비스 동작은 최신 README를 우선합니다.
 

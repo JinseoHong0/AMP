@@ -40,7 +40,7 @@ export default function Home() {
     setError(null);
     setSearch((previous) => ({ ...previous, result: null }));
     try {
-      // BACKEND_TODO: This boundary sends raw natural language; never parse/rank in the browser.
+      // Sends raw natural language; never parse/rank in the browser.
       const response = await ampApi.recommend({
         query: search.query.trim(),
         filters: search.filters,

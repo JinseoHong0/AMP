@@ -29,7 +29,15 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 from database import PROJECT_DIR, connect, init_db
-from models import KST, compute_price, now_utc, to_utc_str, today_kst
+from models import (
+    KST,
+    TRANSLATION_TARGETS,
+    compute_price,
+    now_utc,
+    to_utc_str,
+    today_kst,
+    translation_source_hash,
+)
 from services.venue_matcher import normalize_name
 
 VENUES: list[dict] = [
@@ -153,6 +161,26 @@ EVENTS: list[tuple] = [
 ]
 
 
+# DEMO 영문 검수본 보충: 원문이 있는 4개 필드가 모두 영문을 가질 때만 'reviewed'로 저장한다(DATABASE.md §8).
+DEMO_EN: dict[str, dict[str, str]] = {
+    "밤의 산책": {"title_en": "Night Walk", "drink_policy_en": "Please check the guidance for this event."},
+    "새벽 네온": {"title_en": "Dawn Neon", "drink_policy_en": "One drink included."},
+    "블루 재즈 데이트": {"title_en": "Blue Jazz Date", "drink_policy_en": "One drink order required."},
+    "라운지 언플러그드": {"title_en": "Lounge Unplugged"},
+    "시티팝 나이트": {"title_en": "City Pop Night"},
+}
+
+
+def _demo_translation(source: dict[str, str | None], english: dict[str, str | None], now: str) -> dict:
+    """완전한 영문 묶음이면 reviewed(+지문·시각), 아니면 영문 전체 NULL + not_requested."""
+    complete = all(english[target] for src, target in TRANSLATION_TARGETS.items() if source[src])
+    if complete:
+        return {**english, "translation_status": "reviewed",
+                "translation_source_hash": translation_source_hash(source), "translated_at_utc": now}
+    return {**{t: None for t in TRANSLATION_TARGETS.values()}, "translation_status": "not_requested",
+            "translation_source_hash": None, "translated_at_utc": None}
+
+
 def _kst(day: date, hhmm: str) -> datetime:
     hh, mm = (int(x) for x in hhmm.split(":"))
     return datetime.combine(day, time(hh, mm), tzinfo=KST)
@@ -196,18 +224,27 @@ def seed(conn: sqlite3.Connection, base_date: date | None = None, reset: bool = 
         ends = starts + timedelta(minutes=duration) if duration else None
         doors = starts - timedelta(minutes=doors_before) if doors_before else None
         price_krw, basis = compute_price(price, adv, door)
+        extra = DEMO_EN.get(title, {})
+        tr = _demo_translation(
+            {"title": title, "description_ko": desc_ko, "admission_notes_ko": notes_ko, "drink_policy": drink},
+            {"title_en": extra.get("title_en"), "description_en": desc_en, "admission_notes_en": notes_en,
+             "drink_policy_en": extra.get("drink_policy_en")},
+            now,
+        )
         conn.execute(
-            """INSERT INTO events (venue_id, title, starts_at_utc, ends_at_utc, doors_open_at_utc, price_krw,
-               price_basis, advance_price_krw, door_price_krw, booking_url, lineup_json, genre, mood_tags_json,
-               solo_friendly, seating_type, seat_assignment, drink_policy, description_ko, description_en,
+            """INSERT INTO events (venue_id, title, title_en, starts_at_utc, ends_at_utc, doors_open_at_utc,
+               price_krw, price_basis, advance_price_krw, door_price_krw, booking_url, lineup_json, genre,
+               mood_tags_json, solo_friendly, seating_type, seat_assignment, drink_policy, drink_policy_en,
+               translation_status, translation_source_hash, translated_at_utc, description_ko, description_en,
                admission_notes_ko, admission_notes_en, poster_image_path, status, data_origin, source_url,
                verified_at_utc, created_at_utc, updated_at_utc)
-               VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,NULL,?,'demo',NULL,NULL,?,?)""",
-            (venue_id, title, to_utc_str(starts), to_utc_str(ends) if ends else None,
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,'demo',NULL,NULL,?,?)""",
+            (venue_id, title, tr["title_en"], to_utc_str(starts), to_utc_str(ends) if ends else None,
              to_utc_str(doors) if doors else None, price_krw, basis, adv, door,
              json.dumps(lineup, ensure_ascii=False), genre, json.dumps(moods),
-             None if solo is None else int(solo), seating, assign, drink, desc_ko, desc_en,
-             notes_ko, notes_en, status, now, now),
+             None if solo is None else int(solo), seating, assign, drink, tr["drink_policy_en"],
+             tr["translation_status"], tr["translation_source_hash"], tr["translated_at_utc"],
+             desc_ko, tr["description_en"], notes_ko, tr["admission_notes_en"], status, now, now),
         )
         inserted += 1
 

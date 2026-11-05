@@ -5,7 +5,7 @@ python-multipart>=0.0.9
 python-dotenv>=1.0
 tzdata>=2024.1  # Windows 에서 Asia/Seoul 시간대 데이터
 openpyxl>=3.1  # seed.py 엑셀 데이터 가져오기
+httpx>=0.27  # Gemini API 호출 (services/reason.py)
 
 # test
 pytest>=8.0
-httpx>=0.27

@@ -1,4 +1,4 @@
-"""공연 API: GET /api/events, GET /api/events/{event_id}, POST /api/events(관리자)."""
+"""공연 API: GET /api/events, GET /api/events/{event_id}, POST /api/events · POST /api/events/{id}/translate(관리자)."""
 from __future__ import annotations
 
 import json
@@ -22,6 +22,9 @@ from models import (
     now_utc,
     select_published_events,
     to_utc_str,
+    translation_info,
+    translation_is_current,
+    translation_source_hash,
 )
 from schemas import (
     ApiError,
@@ -32,8 +35,9 @@ from schemas import (
     EventListResponse,
     Locale,
     SeatingType,
+    TranslationRetryResponse,
 )
-from services import poster_parser
+from services import poster_parser, reason
 
 router = APIRouter(prefix="/api/events", tags=["events"])
 
@@ -139,34 +143,39 @@ def create_event(body: EventCreate, conn: sqlite3.Connection = Depends(get_db)) 
 
     lineup = list(dict.fromkeys(s.strip() for s in body.lineup if s and s.strip()))
     moods = list(dict.fromkeys(body.mood_tags))
+    source = {
+        "title": body.title,
+        "description_ko": _clean_text(body.description_ko),
+        "admission_notes_ko": _clean_text(body.admission_notes_ko),
+        "drink_policy": _clean_text(body.drink_policy),
+    }
+
+    # 8) 업로드 ID를 번역 전에 먼저 검사(빠른 실패). 저장 직전 잠금 안에서 한 번 더 검사한다.
+    if body.upload_id:
+        _find_upload(body.upload_id)
+
+    # 9) 최종 원문으로 영문 생성 — 외부 AI 를 기다리는 동안 DB 쓰기 트랜잭션을 열지 않는다.
+    tr = reason.translate_event(source)
 
     with _register_lock:
-        # 8) 업로드 ID: 서버 발급·미사용 임시 파일만
-        temp_path = None
-        if body.upload_id:
-            try:
-                temp_path = poster_parser.find_temp(body.upload_id)
-            except poster_parser.UploadAlreadyUsed:
-                raise ApiError(409, "UPLOAD_ALREADY_USED", "이미 등록에 사용된 포스터입니다.",
-                               {"field": "upload_id"})
-            except poster_parser.UploadNotFound:
-                raise _validation("upload_id", "유효한 업로드 ID가 아닙니다. 포스터를 다시 업로드해 주세요.")
-
+        temp_path = _find_upload(body.upload_id) if body.upload_id else None
         cur = conn.execute(
-            """INSERT INTO events (venue_id, title, starts_at_utc, ends_at_utc, doors_open_at_utc, price_krw,
-               price_basis, advance_price_krw, door_price_krw, booking_url, lineup_json, genre, mood_tags_json,
-               solo_friendly, seating_type, seat_assignment, drink_policy, description_ko, description_en,
+            """INSERT INTO events (venue_id, title, title_en, starts_at_utc, ends_at_utc, doors_open_at_utc,
+               price_krw, price_basis, advance_price_krw, door_price_krw, booking_url, lineup_json, genre,
+               mood_tags_json, solo_friendly, seating_type, seat_assignment, drink_policy, drink_policy_en,
+               translation_status, translation_source_hash, translated_at_utc, description_ko, description_en,
                admission_notes_ko, admission_notes_en, poster_image_path, status, data_origin, source_url,
                verified_at_utc, created_at_utc, updated_at_utc)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'published',?,?,?,?,?)""",
-            (body.venue_id, body.title, to_utc_str(starts), to_utc_str(ends) if ends else None,
-             to_utc_str(doors) if doors else None, price_krw, price_basis, body.advance_price_krw,
-             body.door_price_krw, booking_url, json.dumps(lineup, ensure_ascii=False),
-             _clean_text(body.genre), json.dumps(moods),
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'published',?,?,?,?,?)""",
+            (body.venue_id, body.title, tr.fields["title_en"], to_utc_str(starts),
+             to_utc_str(ends) if ends else None, to_utc_str(doors) if doors else None,
+             price_krw, price_basis, body.advance_price_krw, body.door_price_krw, booking_url,
+             json.dumps(lineup, ensure_ascii=False), _clean_text(body.genre), json.dumps(moods),
              None if body.solo_friendly is None else int(body.solo_friendly),
-             body.seating_type, body.seat_assignment, _clean_text(body.drink_policy),
-             _clean_text(body.description_ko), _clean_text(body.description_en),
-             _clean_text(body.admission_notes_ko), _clean_text(body.admission_notes_en),
+             body.seating_type, body.seat_assignment, source["drink_policy"], tr.fields["drink_policy_en"],
+             tr.status, tr.source_hash, tr.generated_at,
+             source["description_ko"], tr.fields["description_en"],
+             source["admission_notes_ko"], tr.fields["admission_notes_en"],
              body.data_origin, source_url, verified_at, now, now),
         )
         event_id = cur.lastrowid
@@ -184,8 +193,78 @@ def create_event(body: EventCreate, conn: sqlite3.Connection = Depends(get_db)) 
         if body.upload_id:
             poster_parser.mark_used(body.upload_id)
 
-    # 등록 시 영어 자동 번역(AI)은 아직 연결 전이므로 시도하지 않았음을 그대로 알린다 (API.md §8 translation 계약).
-    return {"id": event_id, "status": "published", "poster_url": media_url(poster_path),
-            "translation": {"status": "not_requested", "generated_at": None},
-            "warnings": ["공연은 등록되었으나 영어 번역은 아직 준비되지 않았습니다."],
-            "message": "공연이 등록되었습니다."}
+    translated = tr.status == "generated"
+    return {
+        "id": event_id,
+        "status": "published",
+        "poster_url": media_url(poster_path),
+        "translation": {"status": tr.status, "generated_at": tr.generated_at},
+        "warnings": [] if translated else ["공연은 등록되었으나 영어 번역을 생성하지 못했습니다."],
+        "message": "공연과 영어 번역이 등록되었습니다." if translated else "공연이 등록되었습니다.",
+    }
+
+
+def _find_upload(upload_id: str):
+    try:
+        return poster_parser.find_temp(upload_id)
+    except poster_parser.UploadAlreadyUsed:
+        raise ApiError(409, "UPLOAD_ALREADY_USED", "이미 등록에 사용된 포스터입니다.", {"field": "upload_id"})
+    except poster_parser.UploadNotFound:
+        raise _validation("upload_id", "유효한 업로드 ID가 아닙니다. 포스터를 다시 업로드해 주세요.")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/events/{event_id}/translate — 저장된 원문으로 번역 재시도 (관리자 전용)
+# ---------------------------------------------------------------------------
+_translate_lock = threading.Lock()
+
+
+def _translation_row(conn: sqlite3.Connection, event_id: int):
+    return conn.execute(
+        "SELECT title, description_ko, admission_notes_ko, drink_policy, translation_status, "
+        "translation_source_hash, translated_at_utc FROM events WHERE id = ? AND status = 'published'",
+        (event_id,),
+    ).fetchone()
+
+
+@router.post("/{event_id}/translate", response_model=TranslationRetryResponse,
+             dependencies=[Depends(require_admin)])
+def retry_translation(event_id: int, conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    row = _translation_row(conn, event_id)
+    if row is None:
+        raise ApiError(404, "EVENT_NOT_FOUND", "공연을 찾을 수 없습니다.", {"event_id": event_id})
+    if translation_is_current(row):  # 같은 원문의 정상 번역은 모델 호출 없이 재사용
+        return {"id": event_id, "translation": translation_info(row)}
+
+    source = {key: row[key] for key in ("title", "description_ko", "admission_notes_ko", "drink_policy")}
+    tr = reason.translate_event(source)  # 트랜잭션 밖에서 AI 호출
+
+    with _translate_lock:
+        latest = _translation_row(conn, event_id)
+        if latest is None:
+            raise ApiError(404, "EVENT_NOT_FOUND", "공연을 찾을 수 없습니다.", {"event_id": event_id})
+        if translation_source_hash(latest) != tr.source_hash:
+            raise ApiError(409, "TRANSLATION_SOURCE_CHANGED", "번역 중 원문이 바뀌어 저장하지 않았습니다.",
+                           {"event_id": event_id, "translation": translation_info(latest)})
+        if translation_is_current(latest):  # 동시 요청이 먼저 성공 → 늦은 결과로 덮어쓰지 않음
+            return {"id": event_id, "translation": translation_info(latest)}
+        now = to_utc_str(now_utc())
+        if tr.status == "generated":
+            conn.execute(
+                "UPDATE events SET title_en = ?, description_en = ?, admission_notes_en = ?, drink_policy_en = ?, "
+                "translation_status = 'generated', translation_source_hash = ?, translated_at_utc = ?, "
+                "updated_at_utc = ? WHERE id = ?",
+                (tr.fields["title_en"], tr.fields["description_en"], tr.fields["admission_notes_en"],
+                 tr.fields["drink_policy_en"], tr.source_hash, tr.generated_at, now, event_id),
+            )
+            conn.commit()
+            return {"id": event_id, "translation": {"status": "generated", "generated_at": tr.generated_at}}
+        conn.execute(
+            "UPDATE events SET title_en = NULL, description_en = NULL, admission_notes_en = NULL, "
+            "drink_policy_en = NULL, translation_status = 'failed', translation_source_hash = ?, "
+            "translated_at_utc = NULL, updated_at_utc = ? WHERE id = ?",
+            (tr.source_hash, now, event_id),
+        )
+        conn.commit()
+    raise ApiError(503, "AI_UNAVAILABLE", "영어 번역을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                   {"event_id": event_id, "translation": {"status": "failed", "generated_at": None}})

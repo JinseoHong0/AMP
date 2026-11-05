@@ -63,9 +63,7 @@ def _event_body(**overrides):
         "seat_assignment": None,
         "drink_policy": None,
         "description_ko": None,
-        "description_en": None,
         "admission_notes_ko": None,
-        "admission_notes_en": None,
         "source_url": None,
         "data_origin": "demo",
         "review_confirmed": True,
@@ -200,9 +198,9 @@ def test_register_doc_example_and_reflected_in_list(client):
     body = res.json()
     assert body["status"] == "published" and body["poster_url"] is None
     assert body["message"] == "공연이 등록되었습니다."
-    # 프런트 CreatedEvent 계약: 번역 상태와 경고 (AI 번역 미연결 → not_requested)
-    assert body["translation"] == {"status": "not_requested", "generated_at": None}
-    assert body["warnings"] == ["공연은 등록되었으나 영어 번역은 아직 준비되지 않았습니다."]
+    # 테스트 환경은 AI 키가 없으므로 번역은 실패(failed) — 원문 공연은 201 로 정상 등록 (API.md §8)
+    assert body["translation"] == {"status": "failed", "generated_at": None}
+    assert body["warnings"] == ["공연은 등록되었으나 영어 번역을 생성하지 못했습니다."]
 
     detail = client.get(f"/api/events/{body['id']}").json()
     assert detail["starts_at"] == "2026-11-07T11:00:00Z"  # KST 20:00 → UTC 11:00
@@ -368,7 +366,8 @@ def test_openapi_operations(client):
     assert ops == {
         ("/api/health", "get"), ("/api/events", "get"), ("/api/events/{event_id}", "get"),
         ("/api/venues", "get"), ("/api/venues/{venue_id}", "get"), ("/api/recommend", "post"),
-        ("/api/posters/parse", "post"), ("/api/events", "post"), ("/api/translate", "post"),
+        ("/api/posters/parse", "post"), ("/api/events", "post"),
+        ("/api/events/{event_id}/translate", "post"),
     }
 
 
@@ -389,3 +388,12 @@ def test_register_accepts_frontend_payload_and_4000_char_texts(client):
     assert len(detail["description_ko"]) == 4000 and detail["doors_open_at"] == "2026-11-20T10:00:00Z"
     too_long = client.post("/api/events", json={**payload, "drink_policy": "가" * 4001})
     assert too_long.status_code == 422 and _err(too_long)["details"]["field"] == "drink_policy"
+
+
+def test_register_rejects_server_owned_english_fields(client):
+    """영문·번역 메타데이터는 서버 생성 전용 → 요청에 포함하면 422 (API.md §8 검증 6)."""
+    for field in ("title_en", "description_en", "admission_notes_en", "drink_policy_en", "translation",
+                  "translation_status"):
+        res = client.post("/api/events", json={**_event_body(), field: "x"})
+        assert res.status_code == 422, field
+        assert _err(res)["details"]["field"] == field
