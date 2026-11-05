@@ -308,6 +308,8 @@ def test_register_time_order(client):
         ({"title": "가" * 121}, "title"),
         ({"starts_at_local": None}, "starts_at_local"),
         ({"starts_at_local": "내일 저녁"}, "starts_at_local"),
+        ({"starts_at_local": "2026-11-06T11:59:00"}, "starts_at_local"),  # 고정 시계(12:00 KST)보다 과거
+        ({"starts_at_local": "2026-11-01T07:37:00"}, "starts_at_local"),
         ({"seating_type": "vip"}, "seating_type"),
         ({"seat_assignment": "first_come"}, "seat_assignment"),
         ({"mood_tags": ["cozy"]}, "mood_tags.0"),

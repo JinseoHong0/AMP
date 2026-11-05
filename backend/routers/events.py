@@ -119,6 +119,10 @@ def create_event(body: EventCreate, conn: sqlite3.Connection = Depends(get_db)) 
     starts = local_to_utc(body.starts_at_local)
     ends = local_to_utc(body.ends_at_local) if body.ends_at_local else None
     doors = local_to_utc(body.doors_open_at_local) if body.doors_open_at_local else None
+    # 공연 둘러보기·추천은 앞으로의 공연만 보여 주므로, 지난 일시로 등록하면 어디에도 보이지 않는다 → 거절
+    if starts < now_utc():
+        raise _validation("starts_at_local",
+                          "이미 지난 일시입니다. 앞으로 열릴 공연만 등록할 수 있어요(공연 둘러보기에는 예정 공연만 표시).")
     if doors is not None and doors > starts:
         raise _validation("doors_open_at_local", "입장 시작 시각은 공연 시작 시각보다 늦을 수 없습니다.")
     if ends is not None and ends <= starts:

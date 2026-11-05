@@ -112,6 +112,20 @@ describe('original-only registration', () => {
       ]),
     );
   });
+  it('rejects a start time that has already passed (browse lists upcoming shows only)', () => {
+    const form = {
+      ...emptyRegistration(),
+      title: '원문',
+      venue_id: '1',
+      review_confirmed: true,
+      starts_at_local: '2026-11-01T07:37',
+    };
+    const now = Date.parse('2026-11-06T12:00:00+09:00');
+    expect(validateRegistration(form, t, now).starts_at_local).toBeDefined();
+    expect(validateRegistration({ ...form, starts_at_local: '2026-11-07T19:00' }, t, now)).toEqual(
+      {},
+    );
+  });
   it('computes the representative ticket price and excludes all server-owned fields', () => {
     const form = { ...fromExtraction(extraction), price_krw: '99999', review_confirmed: true };
     const payload = registrationPayload(form, extraction.upload_id);

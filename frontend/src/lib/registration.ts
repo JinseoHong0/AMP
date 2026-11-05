@@ -73,6 +73,7 @@ export type RegistrationErrors = Partial<Record<keyof RegistrationForm, string>>
 export function validateRegistration(
   form: RegistrationForm,
   t: (ko: string, en: string) => string,
+  now: number = Date.now(),
 ): RegistrationErrors {
   const errors: RegistrationErrors = {};
   if (!form.title.trim() || form.title.trim().length > 120)
@@ -89,6 +90,12 @@ export function validateRegistration(
     errors.starts_at_local = t(
       '공연 시작 일시를 입력해 주세요.',
       'Enter a valid show start date and time.',
+    );
+  else if (start < now)
+    // 공연 둘러보기는 예정 공연만 보여 주므로 지난 일시는 등록해도 보이지 않는다 (서버도 422로 거절)
+    errors.starts_at_local = t(
+      '이미 지난 일시예요. 앞으로 열릴 공연만 등록할 수 있어요.',
+      'This time has already passed. Only upcoming shows can be registered.',
     );
   if (
     form.doors_open_at_local &&

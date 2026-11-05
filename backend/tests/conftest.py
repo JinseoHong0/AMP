@@ -26,6 +26,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("LLM_MODEL", "gemini-3.5-flash")
+    monkeypatch.setenv("LLM_THINKING_LEVEL", "low")  # 로컬 .env 값과 무관하게 고정
     return tmp_path
 
 
